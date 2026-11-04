@@ -1,0 +1,7 @@
+.venv/
+.venv-rt/
+models/
+scratch/
+ref/*.wav
+*.npz
+__pycache__/
