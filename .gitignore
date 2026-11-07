@@ -5,3 +5,5 @@ scratch/
 ref/*.wav
 *.npz
 __pycache__/
+gpu/dec_weights.npz
+.venv-xpu/

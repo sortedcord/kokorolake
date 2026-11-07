@@ -24,8 +24,9 @@ def _interp_linear(x: np.ndarray, out_len: int) -> np.ndarray:
     return x[i0] * (1 - w) + x[i1] * w
 
 
-def harmonic_source(f0_80: np.ndarray, lin_w: np.ndarray, lin_b: float, rng=None, noise=True) -> np.ndarray:
-    """f0_80: [2F] predicted F0 at 80 Hz. Returns har [22, 120F+1] float32."""
+def harmonic_source(f0_80: np.ndarray, lin_w: np.ndarray, lin_b: float, rng=None, noise=True, layout="ct") -> np.ndarray:
+    """f0_80: [2F] predicted F0 at 80 Hz. Returns har [22, 120F+1] float32 (layout="ct"),
+    or [120F+1, 32] float16 zero-padded channels (layout="tc", the custom GPU decoder's input)."""
     # float32 throughout, like the original: its phase reaches ~1e5 rad, so fp32
     # rounding is part of the trained behaviour and fp64 would drift from it.
     f0_80 = f0_80.astype(np.float32)
@@ -49,15 +50,21 @@ def harmonic_source(f0_80: np.ndarray, lin_w: np.ndarray, lin_b: float, rng=None
         nz = 0.0
     sw = sines * uv + nz
     src = np.tanh(sw @ lin_w.astype(np.float32) + np.float32(lin_b)).astype(np.float32)  # [L]
-    return stft_mag_phase(src)
+    return stft_mag_phase(src, layout)
 
 
-def stft_mag_phase(x: np.ndarray) -> np.ndarray:
+def stft_mag_phase(x: np.ndarray, layout="ct") -> np.ndarray:
     pad = N_FFT // 2
     xp = np.pad(x, (pad, pad), mode="reflect")
     n_frames = 1 + (len(xp) - N_FFT) // HOP
     idx = np.arange(N_FFT)[None] + HOP * np.arange(n_frames)[:, None]
-    spec = np.fft.rfft(xp[idx] * WINDOW, axis=1).T  # [11, frames]
+    spec = np.fft.rfft(xp[idx] * WINDOW, axis=1)  # [frames, 11]
+    if layout == "tc":
+        out = np.zeros((n_frames, 32), np.float16)
+        out[:, :11] = np.abs(spec)
+        out[:, 11:22] = np.angle(spec)
+        return out
+    spec = spec.T
     return np.concatenate([np.abs(spec), np.angle(spec)], axis=0).astype(np.float32)
 
 

@@ -13,8 +13,16 @@
 No torch at runtime. Text is split into sentence/clause chunks; the first chunk is
 kept short so audio can start as early as possible (stream()).
 """
+import os
+
+# numpy's OpenBLAS spin-waits worker threads on all cores after each small matmul; that
+# burns package power the (power-capped) iGPU needs and ~8x CPU time. Must precede numpy.
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 import json
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -41,8 +49,10 @@ def _bucket(n, buckets):
 
 
 class Engine:
-    def __init__(self, models=HERE / "models", bert_dev="GPU", dec_dev="GPU", cpu_dev="CPU",
+    def __init__(self, models=HERE / "models", bert_dev="GPU", dec_dev="custom", cpu_dev="CPU",
                  dec_buckets=DEC_BUCKETS, bert_buckets=BERT_BUCKETS):
+        """dec_dev: "custom" = hand-written OpenCL/XMX decoder (gpu/kdec.py, exact lengths),
+        or an OpenVINO device ("GPU", "CPU") for the bucketed masked IR decoders."""
         models = Path(models)
         self.core = ov.Core()
         self.core.set_property({"CACHE_DIR": str(models / "cache")})
@@ -50,7 +60,15 @@ class Engine:
         comp = lambda name, dev: self.core.compile_model(self.core.read_model(models / f"{name}.xml"), dev, hint)
         t = time.perf_counter()
         self.bert = {L: comp(f"bert_L{L}", bert_dev).create_infer_request() for L in bert_buckets}
-        self.dec = {F: comp(f"decoder_F{F}", dec_dev).create_infer_request() for F in dec_buckets}
+        self.custom = dec_dev == "custom"
+        if self.custom:
+            sys.path.insert(0, str(HERE / "gpu"))
+            from kdec import MAXF, KDecoder
+            self.kdec = KDecoder()
+            self.dec = {}
+            dec_buckets = (MAXF,)
+        else:
+            self.dec = {F: comp(f"decoder_F{F}", dec_dev).create_infer_request() for F in dec_buckets}
         self.pros = comp("prosody", cpu_dev).create_infer_request()
         self.f0n = comp("f0n", cpu_dev).create_infer_request()
         self.tenc = comp("textenc", cpu_dev).create_infer_request()
@@ -69,7 +87,7 @@ class Engine:
     def warmup(self):
         for L, r in self.bert.items():
             r.infer([np.zeros((1, L), np.int64), np.ones((1, L), np.int64)])
-        for F, r in self.dec.items():
+        for F, r in self.dec.items():  # (OpenVINO decoders only)
             m = lambda n: np.ones((1, 1, n), np.float32)
             r.infer([np.zeros((1, 512, F), np.float32), np.zeros((1, 2 * F), np.float32), np.zeros((1, 2 * F), np.float32),
                      np.zeros((1, 128), np.float32), np.zeros((1, 22, 120 * F + 1), np.float32),
@@ -129,8 +147,23 @@ class Engine:
         tk("cpu_lstm", t)
 
         t = time.perf_counter()
-        har = dsp.harmonic_source(f0[0], self.lin_w, self.lin_b, rng=self.rng)
+        har = dsp.harmonic_source(f0[0], self.lin_w, self.lin_b, rng=self.rng, layout="tc" if self.custom else "ct")
         tk("source", t)
+
+        if self.custom:
+            if Fr > self.dec_buckets[0]:  # longer than the decoder's buffers: split at a pause
+                a, b = self._halve(ps)
+                ya, pa = self.synth_phonemes(a, speed, T)
+                yb, pb = self.synth_phonemes(b, speed, T)
+                return np.concatenate([ya, yb]), np.concatenate([pa, pb])
+            t = time.perf_counter()
+            mag, ph = self.kdec.run(asr[0], f0[0], n[0], s_dec[0], har)
+            tk("decoder", t)
+            t = time.perf_counter()
+            audio = dsp.istft(mag.astype(np.float64), ph.astype(np.float64))
+            tk("istft", t)
+            T["frames"], T["bucket"] = Fr, "exact"
+            return audio, pd
 
         t = time.perf_counter()
         Fb = _bucket(Fr, self.dec_buckets)
