@@ -4,7 +4,46 @@ Custom inference for [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) on 
 Intel Core Ultra 5 225H (Arrow Lake: Arc 130T/140T iGPU, NPU 3720, 14-core CPU) with
 OpenVINO. Goal: lowest time-to-first-audio, then energy, keeping Kokoro's sound.
 
-## Placement (measured)
+## Current pipeline (v2)
+
+| Stage | Where | First-chunk time |
+|---|---|---|
+| G2P (misaki + espeak fallback) | CPU | ~1 ms |
+| PL-BERT (OpenVINO, static token buckets) | GPU | ~7 ms |
+| text encoder LSTM | CPU, concurrently with BERT | hidden |
+| prosody + F0/N LSTMs (OpenVINO, 4 threads) | CPU | ~12 ms |
+| harmonic source + STFT | CPU (numpy) | ~6 ms |
+| decoder + iSTFTNet generator | **GPU, hand-written OpenCL kernels on the XMX units** (`gpu/kdec.py`) | ~55-65 ms |
+| iSTFT | CPU | ~2 ms |
+
+Time to first audio ~85-105 ms, ~330 mJ per second of audio (Piper amy-medium: ~70 ms,
+~490 mJ), real-time factor ~0.05, startup ~3 s.
+
+### Custom decoder (`gpu/kdec.py`)
+- Exact lengths: every kernel takes the sequence length at run time, so there is no
+  padding, no masking, and no per-shape compilation (OpenVINO's GPU plugin needed 0.4-2 s
+  per new shape, so the IR path used padded buckets with masked norms).
+- Convs on the matrix engines: `intel_sub_group_f16_f16_matrix_mad_k16` (DPAS, SIMD8),
+  activations time-major `[T, C]` fp16, weights pre-packed into DPAS A tiles.
+  Transposed convs run as `stride` polyphase convs with an output row stride.
+- Instance-norm statistics come from the conv epilogue (subgroup reductions -> partial
+  rows -> one finalize kernel); norm-apply is fused with leaky-ReLU / snake.
+- Per-call-site cl.Kernel objects keep their arguments, so a new utterance only re-sets
+  length-dependent ints (pyopencl's __call__ costs ~110 us/launch; this ~5 us).
+- 48-49 dB SNR against the fp32 PyTorch decoder.
+
+### Things that mattered more than expected
+- **numpy/OpenBLAS thread spinning**: OpenBLAS keeps ~8 worker threads spinning after
+  each small matmul. On this power-capped laptop that stole the iGPU's power budget:
+  decoder 122 -> 72 ms and ~950 -> 9 ms of CPU time per call with OPENBLAS_NUM_THREADS=1.
+- OpenVINO CPU auto-threading on tiny LSTM graphs (f0n 26 ms / 181 ms CPU vs 9 ms / 35 ms
+  with 4 threads).
+- The iGPU is held at ~1 GHz (of 2.2) by PL4 on the USB-C charger (`throttle_reason_pl4`),
+  and an animated wallpaper (mpvpaper) time-shares it.
+- Updating the Quickshell island at request start competed with synthesis; it now
+  updates when the first audio is ready.
+
+## Placement study (v1, OpenVINO only)
 
 | Stage | Device | Why |
 |---|---|---|

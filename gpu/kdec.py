@@ -28,7 +28,7 @@ __kernel void conv_dpas(
     __global const uint* Wp, __global const float* bias,
     __global const half* R, int ldr, int rdiv, float rscale,
     __global half* Y, int Tq, int ldy, int coff, int Cout_pad, int ostride, int ooff,
-    int K, int dil, int pad, int stride, float oscale)
+    int K, int dil, int pad, int stride, float oscale, __global float* Pst, int pbase)
 {
     const int q = get_global_id(0);
     const int co0 = get_global_id(1) * (8 * MB);
@@ -49,14 +49,33 @@ __kernel void conv_dpas(
             }
         }
     }
-    if (q < Tq) {
-        const int row = q * ostride + ooff;
-        for (int mb = 0; mb < MB; mb++) {
-            const int c = co0 + 8 * mb;
-            float8 v = acc[mb] + vload8(0, bias + c);
-            if (rscale != 0.0f) v += rscale * convert_float8(vload8(0, R + (size_t)(row / rdiv) * ldr + c));
-            vstore_half8(v * oscale, 0, Y + (size_t)row * ldy + coff + c);
+    const bool valid = q < Tq;
+    const int row = q * ostride + ooff;
+    for (int mb = 0; mb < MB; mb++) {
+        const int c = co0 + 8 * mb;
+        float8 v = acc[mb] + vload8(0, bias + c);
+        if (valid && rscale != 0.0f) v += rscale * convert_float8(vload8(0, R + (size_t)(row / rdiv) * ldr + c));
+        v *= oscale;
+        if (valid) vstore_half8(v, 0, Y + (size_t)row * ldy + coff + c);
+#ifdef STATS
+        // per-channel sum / sum of squares over this subgroup's 8 times -> one partial row
+        float8 u = valid ? v : (float8)(0.0f);
+        float8 u2 = u * u;
+        float8 s, ss;
+        s.s0 = sub_group_reduce_add(u.s0); s.s1 = sub_group_reduce_add(u.s1);
+        s.s2 = sub_group_reduce_add(u.s2); s.s3 = sub_group_reduce_add(u.s3);
+        s.s4 = sub_group_reduce_add(u.s4); s.s5 = sub_group_reduce_add(u.s5);
+        s.s6 = sub_group_reduce_add(u.s6); s.s7 = sub_group_reduce_add(u.s7);
+        ss.s0 = sub_group_reduce_add(u2.s0); ss.s1 = sub_group_reduce_add(u2.s1);
+        ss.s2 = sub_group_reduce_add(u2.s2); ss.s3 = sub_group_reduce_add(u2.s3);
+        ss.s4 = sub_group_reduce_add(u2.s4); ss.s5 = sub_group_reduce_add(u2.s5);
+        ss.s6 = sub_group_reduce_add(u2.s6); ss.s7 = sub_group_reduce_add(u2.s7);
+        if (get_sub_group_local_id() == 0) {
+            __global float* pr = Pst + ((size_t)pbase + get_global_id(0) / 8) * 2 * Cout_pad;
+            vstore8(s, 0, pr + c);
+            vstore8(ss, 0, pr + Cout_pad + c);
         }
+#endif
     }
 }
 
@@ -84,13 +103,22 @@ __kernel void stats_part(__global const half* X, int T, int ld, __global float* 
     }
 }
 
-// stage 2: S[2][Cs] = sum over nwg partials
+// stage 2: S[2][Cs] = sum over nwg partial rows (rows of 2*Cs floats)
+// work-group of 64 lanes per 8 consecutive entries of the [2*Cs] row; lanes stride rows
 __kernel void stats_fin(__global const float* P, int nwg, __global float* S, int Cs)
 {
-    const int i = get_global_id(0);       // 0 .. 2*Cs-1
-    float a = 0.0f;
-    for (int g = 0; g < nwg; g++) a += P[(size_t)g * 2 * Cs + i];
-    S[i] = a;
+    const int i8 = get_group_id(0) * 8;   // entry 0 .. 2*Cs-1
+    const int l = get_local_id(0), L = get_local_size(0);
+    float8 a = 0.0f;
+    for (int g = l; g < nwg; g += L) a += vload8(0, P + (size_t)g * 2 * Cs + i8);
+    __local float8 sm[64];
+    sm[l] = a;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int w = L / 2; w > 0; w >>= 1) {
+        if (l < w) sm[l] += sm[l + w];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (l == 0) vstore8(sm[0], 0, S + i8);
 }
 
 // Y = act(norm(X * iscale)), norm: (x-mean)*rstd*G + B (G/B fold AdaIN style + affine)
@@ -131,6 +159,123 @@ __kernel void dwup2(__global const half* X, int T, int ld, __global half* Y, __g
     vstore_half8(vload8(0, W + c) * xn + vload8(0, W + 2 * Cs + c) * x + b, 0, Y + (size_t)(2 * t + 1) * ld + c);
 }
 
+
+// ---------------------------------------------------------------- grouped (3 resblock branches)
+#define SEL3(b, a0, a1, a2) ((b) == 0 ? (a0) : (b) == 1 ? (a1) : (a2))
+
+__attribute__((intel_reqd_sub_group_size(8)))
+__kernel void conv3(
+    __global const half* X0, __global const half* X1, __global const half* X2, int Tin, int C_pad,
+    __global const uint* W0, __global const uint* W1, __global const uint* W2,
+    __global const float* B0, __global const float* B1, __global const float* B2,
+    __global const half* R0, __global const half* R1, __global const half* R2, float rscale,
+    __global half* Y0, __global half* Y1, __global half* Y2,
+    int4 Kv, int4 padv, int dil, __global float* Pst, int pstride)
+{
+    const int br = get_global_id(2);
+    __global const half* X = SEL3(br, X0, X1, X2);
+    __global const uint* Wp = SEL3(br, W0, W1, W2);
+    __global const float* bias = SEL3(br, B0, B1, B2);
+    __global const half* R = SEL3(br, R0, R1, R2);
+    __global half* Y = SEL3(br, Y0, Y1, Y2);
+    const int K = SEL3(br, Kv.s0, Kv.s1, Kv.s2), pad = SEL3(br, padv.s0, padv.s1, padv.s2);
+    const int q = get_global_id(0);
+    const int co0 = get_global_id(1) * (8 * MB);
+    const int nci = C_pad / 16, nco8 = C_pad / 8;
+    float8 acc[MB];
+    for (int mb = 0; mb < MB; mb++) acc[mb] = (float8)(0.0f);
+    for (int k = 0; k < K; k++) {
+        const int tin = q + k * dil - pad;
+        const bool ok = (q < Tin) && (tin >= 0) && (tin < Tin);
+        __global const int* xrow = (__global const int*)(X + (size_t)(ok ? tin : 0) * C_pad);
+        __global const uint* wk = Wp + ((size_t)k * nco8 + co0 / 8) * nci * 64;
+        for (int cb = 0; cb < nci; cb++) {
+            int8 b = ok ? vload8(0, xrow + cb * 8) : (int8)(0);
+            for (int mb = 0; mb < MB; mb++) {
+                int8 a = as_int8(intel_sub_group_block_read8(wk + ((size_t)mb * nci + cb) * 64));
+                acc[mb] = intel_sub_group_f16_f16_matrix_mad_k16(a, b, acc[mb]);
+            }
+        }
+    }
+    const bool valid = q < Tin;
+    for (int mb = 0; mb < MB; mb++) {
+        const int c = co0 + 8 * mb;
+        float8 v = acc[mb] + vload8(0, bias + c);
+        if (valid && rscale != 0.0f) v += rscale * convert_float8(vload8(0, R + (size_t)q * C_pad + c));
+        if (valid) vstore_half8(v, 0, Y + (size_t)q * C_pad + c);
+#ifdef STATS
+        float8 u = valid ? v : (float8)(0.0f);
+        float8 u2 = u * u;
+        float8 s, ss;
+        s.s0 = sub_group_reduce_add(u.s0); s.s1 = sub_group_reduce_add(u.s1);
+        s.s2 = sub_group_reduce_add(u.s2); s.s3 = sub_group_reduce_add(u.s3);
+        s.s4 = sub_group_reduce_add(u.s4); s.s5 = sub_group_reduce_add(u.s5);
+        s.s6 = sub_group_reduce_add(u.s6); s.s7 = sub_group_reduce_add(u.s7);
+        ss.s0 = sub_group_reduce_add(u2.s0); ss.s1 = sub_group_reduce_add(u2.s1);
+        ss.s2 = sub_group_reduce_add(u2.s2); ss.s3 = sub_group_reduce_add(u2.s3);
+        ss.s4 = sub_group_reduce_add(u2.s4); ss.s5 = sub_group_reduce_add(u2.s5);
+        ss.s6 = sub_group_reduce_add(u2.s6); ss.s7 = sub_group_reduce_add(u2.s7);
+        if (get_sub_group_local_id() == 0) {
+            __global float* pr = Pst + ((size_t)br * pstride + get_global_id(0) / 8) * 2 * C_pad;
+            vstore8(s, 0, pr + c);
+            vstore8(ss, 0, pr + C_pad + c);
+        }
+#endif
+    }
+}
+
+// 3 normact in one launch (same T, C); per-branch input/output/stats/style offset/alpha
+__kernel void normact3(__global const half* X0, __global const half* X1, __global const half* X2,
+    __global half* Y0, __global half* Y1, __global half* Y2, int ld,
+    __global const float* S0, __global const float* S1, __global const float* S2, float invT,
+    __global const float* GB, int4 goff,
+    __global const float* A0, __global const float* A1, __global const float* A2)
+{
+    const int br = get_global_id(2);
+    const int c = get_global_id(0) * 8;
+    const int t = get_global_id(1);
+    __global const half* X = SEL3(br, X0, X1, X2);
+    __global half* Y = SEL3(br, Y0, Y1, Y2);
+    __global const float* S = SEL3(br, S0, S1, S2);
+    __global const float* alpha = SEL3(br, A0, A1, A2);
+    const int go = SEL3(br, goff.s0, goff.s1, goff.s2);
+    float8 v = convert_float8(vload8(0, X + (size_t)t * ld + c));
+    float8 mean = vload8(0, S + c) * invT;
+    float8 var = fmax(vload8(0, S + ld + c) * invT - mean * mean, 0.0f);
+    v = (v - mean) * (rsqrt(var + 1e-5f) * vload8(0, GB + go + c)) + vload8(0, GB + go + ld + c);
+    float8 a = vload8(0, alpha + c);
+    float8 sn = native_sin(a * v);
+    v = v + sn * sn / a;
+    vstore_half8(v, 0, Y + (size_t)t * ld + c);
+}
+
+// 3 stats finalizations: branch br sums rows [br*pstride, br*pstride + nrows)
+__kernel void fin3(__global const float* P, int nrows, int pstride, int Cs,
+                   __global float* S0, __global float* S1, __global float* S2)
+{
+    const int br = get_group_id(1);
+    __global float* S = SEL3(br, S0, S1, S2);
+    const int i8 = get_group_id(0) * 8;
+    const int l = get_local_id(0), L = get_local_size(0);
+    float8 a = 0.0f;
+    for (int g = l; g < nrows; g += L) a += vload8(0, P + ((size_t)br * pstride + g) * 2 * Cs + i8);
+    __local float8 sm[64];
+    sm[l] = a;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int w = L / 2; w > 0; w >>= 1) {
+        if (l < w) sm[l] += sm[l + w];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (l == 0) vstore8(sm[0], 0, S + i8);
+}
+
+// acc = Y0 + Y1 + Y2
+__kernel void sum3(__global half* A, __global const half* Y0, __global const half* Y1, __global const half* Y2, int ld)
+{
+    const size_t i = (size_t)get_global_id(1) * ld + get_global_id(0) * 8;
+    vstore_half8(convert_float8(vload8(0, Y0 + i)) + convert_float8(vload8(0, Y1 + i)) + convert_float8(vload8(0, Y2 + i)), 0, A + i);
+}
+
 // Y = a*Y + b*X
 __kernel void axpby(__global half* Y, __global const half* X, int ld, float a, float b)
 {
@@ -140,17 +285,30 @@ __kernel void axpby(__global half* Y, __global const half* X, int ld, float a, f
 }
 
 // reflection pad (1,0) after ups[1] whose epilogue already added XS: row0 = (Y[2]-XS[2]) + XS[0]
-__kernel void reflect_fix(__global half* Y, __global const half* XS, int ld)
+__kernel void reflect_fix(__global half* Y, __global const half* XS, int ld, __global float* P, int prow)
 {
     const int c = get_global_id(0) * 8;
     float8 v = convert_float8(vload8(0, Y + 2 * ld + c)) - convert_float8(vload8(0, XS + 2 * ld + c))
              + convert_float8(vload8(0, XS + c));
     vstore_half8(v, 0, Y + c);
+    __global float* pr = P + (size_t)prow * 2 * ld;
+    vstore8(v, 0, pr + c);
+    vstore8(v * v, 0, pr + ld + c);
 }
 """
 
 KS = (3, 7, 11)
-MAXF = 256  # largest chunk (frames at 40 Hz) buffers are sized for
+
+
+def src_t(t):
+    return t
+
+
+def i4(a, b, c, d=0):
+    from pyopencl import cltypes
+    return cltypes.make_int4(a, b, c, d)
+MAXF = 256  # largest chunk (frames at 40 Hz); buffers grow on demand up to this
+GROUPED = False  # 3 resblock branches per launch: correct, but slower here (k=11 branch tail)
 DILS = (1, 3, 5)
 
 
@@ -184,7 +342,9 @@ class Conv:
         self.name = f"conv{Cin}->{Cout} k{K} d{dil} s{stride}"
 
     def __call__(self, dec, X, Tin, ldx, Y, Tq, ldy, coff=0, R=None, ldr=0, rdiv=1, rscale=0.0,
-                 ostride=1, ooff=0, oscale=1.0):
+                 ostride=1, ooff=0, oscale=1.0, pbase=None):
+        """pbase: if set, also write per-channel partial stats rows starting at pbase
+        (dec.P); returns the number of rows written."""
         assert ldx >= self.Cin_pad
         nsg = (Tq + 7) // 8
         g0 = (nsg + 7) // 8 * 64
@@ -196,12 +356,15 @@ class Conv:
                 MB = m
                 break
         dec._last_conv = self.name
-        dec.launch(dec.conv_prg[MB], "conv_dpas", (g0, self.Cout_pad // (8 * MB)), (64, 1),
+        prg = dec.conv_prg[MB] if pbase is None else dec.conv_prg_s[MB]
+        dec.launch(prg, "conv_dpas", (g0, self.Cout_pad // (8 * MB)), (64, 1),
                  X, np.int32(Tin), np.int32(ldx), np.int32(self.Cin_pad), self.W, self.b,
                  R if R is not None else dec.dummy, np.int32(ldr), np.int32(rdiv), np.float32(rscale),
                  Y, np.int32(Tq), np.int32(ldy), np.int32(coff), np.int32(self.Cout_pad),
                  np.int32(ostride), np.int32(ooff), np.int32(self.K), np.int32(self.dil),
-                 np.int32(self.pad), np.int32(self.stride), np.float32(oscale))
+                 np.int32(self.pad), np.int32(self.stride), np.float32(oscale),
+                 dec.P, np.int32(pbase or 0))
+        return g0 // 8
 
 
 class ConvT:
@@ -222,13 +385,15 @@ class ConvT:
     def out_len(self, Lin):
         return (Lin - 1) * self.s - 2 * self.p + self.K
 
-    def __call__(self, dec, X, Tin, ldx, Y, ldy, row_off=0, R=None, ldr=0):
+    def __call__(self, dec, X, Tin, ldx, Y, ldy, row_off=0, R=None, ldr=0, stats=False):
+        """Returns (Lout, partial stats rows written)."""
         Lout = self.out_len(Tin)
+        rows = 0
         for r, conv in self.phases:
             Tq = (Lout - r + self.s - 1) // self.s
-            conv(dec, X, Tin, ldx, Y, Tq, ldy, R=R, ldr=ldr, rscale=1.0 if R is not None else 0.0,
-                 ostride=self.s, ooff=r + row_off)
-        return Lout
+            rows += conv(dec, X, Tin, ldx, Y, Tq, ldy, R=R, ldr=ldr, rscale=1.0 if R is not None else 0.0,
+                         ostride=self.s, ooff=r + row_off, pbase=rows if stats else None)
+        return Lout, rows
 
 
 class Norm:
@@ -253,10 +418,12 @@ class KDecoder:
         self.dev = [d for d in plat.get_devices() if d.type & cl.device_type.GPU][0]
         self.ctx = cl.Context([self.dev])
         self.q = cl.CommandQueue(self.ctx)
-        self.conv_k = {}
+        self.conv_k, self.conv_ks = {}, {}
         for mb in (1, 2, 4, 8):
-            prg = cl.Program(self.ctx, SRC).build(options=[f"-DMB={mb}", "-cl-mad-enable", "-cl-fast-relaxed-math"])
+            opts = [f"-DMB={mb}", "-cl-mad-enable", "-cl-fast-relaxed-math"]
+            prg = cl.Program(self.ctx, SRC).build(options=opts)
             self.conv_k[mb] = prg.conv_dpas
+            self.conv_ks[mb] = cl.Program(self.ctx, SRC).build(options=opts + ["-DSTATS"]).conv_dpas
         self.prg = prg
         self.k_stats_part, self.k_stats_fin = prg.stats_part, prg.stats_fin
         self.k_normact, self.k_dwup2 = prg.normact, prg.dwup2
@@ -269,8 +436,16 @@ class KDecoder:
         self._last_conv = ""
         self._site = 0
         self.conv_prg = {mb: self.conv_k[mb].program for mb in self.conv_k}
+        self.conv_prg_s = {mb: self.conv_ks[mb].program for mb in self.conv_ks}
+        self.S3 = [cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE, 2 * 256 * 4) for _ in range(3)]
         self._build(sd)
-        self.reserve(MAXF)
+        # keep only what run() needs on the host; the rest now lives on the GPU
+        keep = ("F0_conv.weight", "F0_conv.bias", "N_conv.weight", "N_conv.bias", "asr_res.0.weight", "asr_res.0.bias")
+        self.sd = {k: sd[k] for k in keep}
+        for nm in self.norms:
+            nm.fcW = nm.fcb = None
+        del sd
+        self.reserve(96)  # typical chunk; larger ones grow buffers once
 
     # ------------------------------------------------------------------ launch with cached args
     # Each call site (by order within run()) owns a cl.Kernel whose arguments persist, so a
@@ -287,7 +462,8 @@ class KDecoder:
         k, cache = st[1], st[2]
         for j, a in enumerate(args):
             c = cache[j]
-            if c is a or (c is not None and type(c) is type(a) and not isinstance(a, cl.MemoryObjectHolder) and c == a):
+            if c is a or (c is not None and type(c) is type(a) and not isinstance(a, cl.MemoryObjectHolder)
+                          and bool(np.all(c == a))):
                 continue
             k.set_arg(j, a)
             cache[j] = a
@@ -348,7 +524,8 @@ class KDecoder:
         self.fcb_all = np.concatenate([nm.fcb for nm in self.norms]).astype(np.float32)
         self.GBbuf = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY, off * 4)
         self.S = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE, 2 * 1104 * 4 * 4)  # stats scratch (reused)
-        self.P = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE, 4096 * 2 * 1104 * 4)  # stats partials
+        self.Sx = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE, 2 * 1104 * 4 * 4)  # stats of a stage input (kept)
+        self.P = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE, 12 << 20)  # stats partial rows (3 branches at MAXF)
         self._bufs = {}
 
     # ------------------------------------------------------------------ helpers
@@ -365,12 +542,18 @@ class KDecoder:
         RL = max(1, min(64, 1024 // c8, 256 // c8 if c8 <= 256 else 1))
         rows = max(RL * 16, 256)
         nwg = (T + rows - 1) // rows
+        assert nwg * 2 * Cs * 4 <= self.P.size, (T, Cs)
         self.launch(self.prg, "stats_part", (c8, nwg * RL), (c8, RL), X, np.int32(T), np.int32(ld), self.P,
                           np.int32(Cs), np.int32(rows))
-        self.launch(self.prg, "stats_fin", (2 * Cs,), None, self.P, np.int32(nwg), self.S, np.int32(Cs))
+        self.launch(self.prg, "stats_fin", (2 * Cs // 8 * 64,), (64,), self.P, np.int32(nwg), self.S, np.int32(Cs))
 
-    def normact(self, X, T, ldx, Y, ldy, Cs, norm=None, act=0, slope=0.0, iscale=1.0):
-        self.launch(self.prg, "normact", (Cs // 8, T), None, X, np.int32(ldx), Y, np.int32(ldy), self.S, np.int32(Cs),
+    def fin(self, nrows, Cs, S):
+        """Sum `nrows` partial stats rows of dec.P into S [2][Cs]."""
+        assert nrows * 2 * Cs * 4 <= self.P.size
+        self.launch(self.prg, "stats_fin", (2 * Cs // 8 * 64,), (64,), self.P, np.int32(nrows), S, np.int32(Cs))
+
+    def normact(self, X, T, ldx, Y, ldy, Cs, norm=None, act=0, slope=0.0, iscale=1.0, S=None):
+        self.launch(self.prg, "normact", (Cs // 8, T), None, X, np.int32(ldx), Y, np.int32(ldy), S or self.S, np.int32(Cs),
                        np.float32(1.0 / T), self.GBbuf, np.int32(norm.goff if norm else 0),
                        np.int32(norm is not None), np.int32(act), np.float32(slope),
                        norm.alpha if norm else self.dummy, np.float32(iscale))
@@ -393,24 +576,22 @@ class KDecoder:
         b["sc"](self, X, T, ldx, sc, T, Cout)
         b["c2"](self, t2, T, Cout, Y, T, ldy, coff=coff, R=sc, ldr=Cout, rscale=1.0, oscale=1 / math.sqrt(2))
 
-    def ada_resblock1(self, units, X, T, C, out, shared_stats=False):
-        """istftnet.AdaINResBlock1 on X [T, C] -> out [T, C] (out may not alias X)."""
+    def ada_resblock1(self, units, X, T, C, out, Sx, last_stats=False):
+        """istftnet.AdaINResBlock1 on X [T, C] -> out [T, C]. Sx holds stats(X) already.
+        Conv epilogues produce the stats each following norm needs."""
         t = self.buf(f"rb_t{C}", T, C)
         h = self.buf(f"rb_h{C}", T, C)
-        cur = X
+        cur, Scur = X, Sx
         for j, u in enumerate(units):
-            if j > 0 or not shared_stats:
-                self.stats(cur, T, C, C)
-            self.normact(cur, T, C, t, C, C, u["n1"], act=2)
-            u["c1"](self, t, T, C, h, T, C)
-            if j == 0:
-                # keep stats of X intact for sibling branches: stats(h) goes to a second scratch
-                pass
-            self.stats(h, T, C, C)
-            self.normact(h, T, C, t, C, C, u["n2"], act=2)
-            # cur_new = conv2(t) + cur ; first unit writes into `out` (X stays intact)
-            u["c2"](self, t, T, C, out, T, C, R=cur, ldr=C, rscale=1.0)
-            cur = out
+            self.normact(cur, T, C, t, C, C, u["n1"], act=2, S=Scur)
+            rows = u["c1"](self, t, T, C, h, T, C, pbase=0)
+            self.fin(rows, C, self.S)
+            self.normact(h, T, C, t, C, C, u["n2"], act=2, S=self.S)
+            need = j < len(units) - 1 or last_stats
+            rows = u["c2"](self, t, T, C, out, T, C, R=cur, ldr=C, rscale=1.0, pbase=0 if need else None)
+            if need:
+                self.fin(rows, C, self.S)
+            cur, Scur = out, self.S
 
     # ------------------------------------------------------------------ forward
     def run(self, asr, f0, n, s, har):
@@ -482,27 +663,30 @@ class KDecoder:
         a = self.buf("g_act0", T80, 512)
         self.normact(G0, T80, 512, a, 512, 512, None, act=1, slope=0.1)
         nc = self.buf("nc0", T800, 256)
-        self.noise_convs[0](self, Hb, T4800, 32, nc, T800, 256)
+        rows = self.noise_convs[0](self, Hb, T4800, 32, nc, T800, 256, pbase=0)
+        self.fin(rows, 256, self.Sx)
         xs = self.buf("xs0", T800, 256)
-        self.stats(nc, T800, 256, 256)
-        self.ada_resblock1(self.noise_res[0], nc, T800, 256, xs, shared_stats=True)
+        self.ada_resblock1(self.noise_res[0], nc, T800, 256, xs, self.Sx)
         x0 = self.buf("x0", T800, 256)
-        L = self.ups[0](self, a, T80, 512, x0, 256, R=xs, ldr=256)
+        L, rows = self.ups[0](self, a, T80, 512, x0, 256, R=xs, ldr=256, stats=True)
         assert L == T800, (L, T800)
+        self.fin(rows, 256, self.Sx)
         acc = self.avg_resblocks(self.resblocks[:3], x0, T800, 256, "0")
 
         # ---- generator stage 1 (4800 Hz, 128 ch)
         a1 = self.buf("g_act1", T800, 256)
         self.normact(acc, T800, 256, a1, 256, 256, None, act=1, slope=0.1, iscale=1 / 3)
         nc1 = self.buf("nc1", T4800, 128)
-        self.noise_convs[1](self, Hb, T4800, 32, nc1, T4800, 128)
+        rows = self.noise_convs[1](self, Hb, T4800, 32, nc1, T4800, 128, pbase=0)
+        self.fin(rows, 128, self.Sx)
         xs1 = self.buf("xs1", T4800, 128)
-        self.stats(nc1, T4800, 128, 128)
-        self.ada_resblock1(self.noise_res[1], nc1, T4800, 128, xs1, shared_stats=True)
+        self.ada_resblock1(self.noise_res[1], nc1, T4800, 128, xs1, self.Sx)
         x1 = self.buf("x1", T4800, 128)
-        L = self.ups[1](self, a1, T800, 256, x1, 128, row_off=1, R=xs1, ldr=128)
+        L, rows = self.ups[1](self, a1, T800, 256, x1, 128, row_off=1, R=xs1, ldr=128, stats=True)
         assert L + 1 == T4800, (L, T4800)
-        self.launch(self.prg, "reflect_fix", (16,), None, x1, xs1, np.int32(128))
+        # row 0 (reflection pad) is written after the epilogue stats: add it as one more partial row
+        self.launch(self.prg, "reflect_fix", (16,), None, x1, xs1, np.int32(128), self.P, np.int32(rows))
+        self.fin(rows + 1, 128, self.Sx)
         acc1 = self.avg_resblocks(self.resblocks[3:], x1, T4800, 128, "1")
 
         # ---- conv_post
@@ -529,14 +713,62 @@ class KDecoder:
                  z((22, 120 * F + 1), np.float32))
 
     def avg_resblocks(self, rbs, x, T, C, tag):
+        if not GROUPED:
+            return self.avg_resblocks_seq(rbs, x, T, C, tag)
+        return self.avg_resblocks_grouped(rbs, x, T, C, tag)
+
+    def avg_resblocks_seq(self, rbs, x, T, C, tag):
+        """mean of the resblocks on x (returned as a sum; callers scale by 1/3). self.Sx = stats(x)."""
         acc = self.buf(f"acc{tag}", T, C)
         br = self.buf(f"br{tag}", T, C)
-        self.stats(x, T, C, C)
         for i, rb in enumerate(rbs):
-            # stats(x) are recomputed per branch inside unit 0 only if needed; S is overwritten
-            # by later stats calls, so recompute for branches 2/3.
-            if i > 0:
-                self.stats(x, T, C, C)
-            self.ada_resblock1(rb, x, T, C, br, shared_stats=True)
+            self.ada_resblock1(rb, x, T, C, br, self.Sx)
             self.axpby(acc, br, T, C, 0.0 if i == 0 else 1.0, 1.0)
+        return acc
+
+    def avg_resblocks_grouped(self, rbs, x, T, C, tag):
+        """Sum of the three resblocks on x, all three branches per launch (grouped kernels).
+        self.Sx = stats(x). Returns the sum (callers scale by 1/3)."""
+        t = [self.buf(f"g{tag}t{b}", T, C) for b in range(3)]
+        h = [self.buf(f"g{tag}h{b}", T, C) for b in range(3)]
+        o = [self.buf(f"g{tag}o{b}", T, C) for b in range(3)]
+        S = self.S3
+        nsg = (T + 7) // 8
+        g0 = (nsg + 7) // 8 * 64
+        n8 = C // 8
+        MB = 1
+        for m in (8, 4, 2):
+            if n8 % m == 0 and 3 * nsg * (n8 // m) >= self.min_sg:
+                MB = m
+                break
+        prow = g0 // 8  # partial rows per branch
+        assert 3 * prow * 2 * C * 4 <= self.P.size
+        cur = [x, x, x]
+        Scur = [self.Sx] * 3
+        units = list(zip(*rbs))  # units[j] = (rb0[j], rb1[j], rb2[j])
+        for j, us in enumerate(units):
+            last = j == len(units) - 1
+            for half_, (nk, ck) in enumerate((("n1", "c1"), ("n2", "c2"))):
+                src = cur if half_ == 0 else h
+                Ssrc = Scur if half_ == 0 else S
+                self.launch(self.prg, "normact3", (C // 8, T, 3), None, *src, *t, np.int32(C), *Ssrc,
+                            np.float32(1.0 / T), self.GBbuf, i4(*[u[nk].goff for u in us]),
+                            *[u[nk].alpha for u in us])
+                convs = [u[ck] for u in us]
+                stats = not (half_ == 1 and last)
+                prg = self.conv_prg_s[MB] if stats else self.conv_prg[MB]
+                dst = h if half_ == 0 else o
+                R = cur if half_ == 1 else [self.dummy] * 3
+                self._last_conv = f"conv3 {convs[0].Cin} k{[c.K for c in convs]} d{convs[0].dil}"
+                self.launch(prg, "conv3", (g0, C // (8 * MB), 3), (64, 1, 1), *src_t(t), np.int32(T), np.int32(C),
+                            *[c.W for c in convs], *[c.b for c in convs], *R, np.float32(1.0 if half_ == 1 else 0.0),
+                            *dst, i4(*[c.K for c in convs]),
+                            i4(*[c.pad for c in convs]), np.int32(convs[0].dil),
+                            self.P, np.int32(prow))
+                if stats:
+                    self.launch(self.prg, "fin3", (2 * C // 8 * 64, 3), (64, 1), self.P, np.int32(prow),
+                                np.int32(prow), np.int32(C), *S)
+            cur, Scur = o, S
+        acc = self.buf(f"acc{tag}", T, C)
+        self.launch(self.prg, "sum3", (C // 8, T), None, acc, *o, np.int32(C))
         return acc

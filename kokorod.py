@@ -6,8 +6,13 @@ Socket $XDG_RUNTIME_DIR/ttsd.sock; first line is a command, the rest (until EOF)
   STOP              cut off current speech and clear the queue
 The Quickshell island is told what is being said (quickshell ipc call voice say/sayEnd).
 """
-import argparse
 import os
+
+# before numpy: single-threaded BLAS (see engine.py; spinning BLAS threads cost latency and power)
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
+import argparse
 import queue
 import signal
 import socket
@@ -74,7 +79,8 @@ class Speaker:
                 island("sayEnd")
 
     def _speak(self, text, gen):
-        island("say", text)
+        # The island is updated when the first audio is ready: its redraw (and the
+        # quickshell process spawn) would otherwise compete with synthesis for GPU/CPU.
         t0 = time.perf_counter()
         player = None
         try:
@@ -90,6 +96,7 @@ class Speaker:
                             stdin=subprocess.PIPE)
                         self.player = player
                     log(f"first audio after {(time.perf_counter() - t0) * 1e3:.0f} ms")
+                    island("say", text)
                 pcm = (np.clip(audio, -1, 1) * 32767).astype(np.int16).tobytes()
                 player.stdin.write(pcm)
                 player.stdin.flush()
@@ -111,14 +118,16 @@ class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--socket", default=str(RUNTIME / "ttsd.sock"))
-    ap.add_argument("--device", default=os.environ.get("KOKORO_DEVICE", "GPU"))
+    ap.add_argument("--device", default=os.environ.get("KOKORO_DEVICE", "GPU"), help="BERT device")
+    ap.add_argument("--decoder", default=os.environ.get("KOKORO_DECODER", "custom"),
+                    help='"custom" (OpenCL/XMX kernels) or an OpenVINO device')
     args = ap.parse_args()
 
     t = time.perf_counter()
     try:
-        eng = Engine(bert_dev=args.device, dec_dev=args.device)
+        eng = Engine(bert_dev=args.device, dec_dev=args.decoder)
     except Exception as ex:
-        log(f"{args.device} failed ({ex}); falling back to CPU")
+        log(f"{args.device}/{args.decoder} failed ({ex}); falling back to CPU")
         eng = Engine(bert_dev="CPU", dec_dev="CPU")
     log(f"engine ready in {time.perf_counter() - t:.1f}s")
     sp = Speaker(eng)

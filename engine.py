@@ -69,9 +69,13 @@ class Engine:
             dec_buckets = (MAXF,)
         else:
             self.dec = {F: comp(f"decoder_F{F}", dec_dev).create_infer_request() for F in dec_buckets}
-        self.pros = comp("prosody", cpu_dev).create_infer_request()
-        self.f0n = comp("f0n", cpu_dev).create_infer_request()
-        self.tenc = comp("textenc", cpu_dev).create_infer_request()
+        # small LSTM graphs: OpenVINO's automatic threading spins ~14 cores for a few ms of
+        # work (f0n: 26 ms wall / 181 ms CPU); 4 threads is fastest (9 ms / 35 ms CPU).
+        cpu_cfg = dict(hint, INFERENCE_NUM_THREADS=4) if cpu_dev == "CPU" else hint
+        compc = lambda name: self.core.compile_model(self.core.read_model(models / f"{name}.xml"), cpu_dev, cpu_cfg)
+        self.pros = compc("prosody").create_infer_request()
+        self.f0n = compc("f0n").create_infer_request()
+        self.tenc = compc("textenc").create_infer_request()
         self.load_s = time.perf_counter() - t
         a = np.load(models / "assets.npz")
         self.voice = a["voice"]  # [510,1,256]
@@ -125,6 +129,8 @@ class Engine:
         s_dec, s_pros = ref_s[:, :128].astype(np.float32), ref_s[:, 128:].astype(np.float32)
 
         t = time.perf_counter()
+        # text encoder only needs the ids: run it on CPU while BERT runs on the GPU
+        self.tenc.start_async([np.array([ids], np.int64)])
         Lb = _bucket(L, self.bert_buckets)
         idp = np.zeros((1, Lb), np.int64); idp[0, :L] = ids
         att = np.zeros((1, Lb), np.int64); att[0, :L] = 1
@@ -142,7 +148,8 @@ class Engine:
         en = np.ascontiguousarray(d[0].T[:, idx][None])  # d^T @ aln == gather
         r = self.f0n.infer([en, s_pros])
         f0, n = r[0], r[1]
-        t_en = self.tenc.infer([np.array([ids], np.int64)])[0]
+        self.tenc.wait()
+        t_en = self.tenc.get_output_tensor(0).data
         asr = np.ascontiguousarray(t_en[:, :, idx])
         tk("cpu_lstm", t)
 

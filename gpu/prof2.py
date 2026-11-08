@@ -4,7 +4,7 @@ import numpy as np, pyopencl as cl
 from kdec import KDecoder
 dec=KDecoder()
 dec.q=cl.CommandQueue(dec.ctx, properties=cl.command_queue_properties.PROFILING_ENABLE)
-dec._sites={}; dec.reserve(256)
+dec._sites={}; dec.reserve(128)
 x=np.load(sys.argv[1] if len(sys.argv)>1 else "bench_inputs.npz"); args=(x["asr"][0], x["f0"][0], x["n"][0], x["s"][0], x["har"])
 for _ in range(3): dec.run(*args)
 dec.events=[]; t=time.perf_counter(); dec.run(*args); wall=(time.perf_counter()-t)*1e3
