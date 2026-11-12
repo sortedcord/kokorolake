@@ -276,6 +276,90 @@ __kernel void sum3(__global half* A, __global const half* Y0, __global const hal
     vstore_half8(convert_float8(vload8(0, Y0 + i)) + convert_float8(vload8(0, Y1 + i)) + convert_float8(vload8(0, Y2 + i)), 0, A + i);
 }
 
+
+// ---------------------------------------------------------------- DSP on the GPU
+inline uint hash32(uint x) {  // lowbias32
+    x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16; return x;
+}
+inline float gauss(uint a, uint seed) {  // Box-Muller from two hashed uniforms
+    float u1 = ((float)(hash32(a * 2u + seed) >> 8) + 0.5f) * (1.0f / 16777216.0f);
+    float u2 = ((float)(hash32(a * 2u + 1u + seed * 7919u) >> 8) + 0.5f) * (1.0f / 16777216.0f);
+    return sqrt(-2.0f * log(u1)) * cos(6.283185307f * u2);
+}
+
+// SourceModuleHnNSF + SineGen (see dsp.harmonic_source): PH = cumsum(rad)*2pi at 80 Hz [T80][9]
+__kernel void source(__global const float* PH, __global const float* F0, int T80, __global float* SRC, int L,
+                     __global const float* linw, float linb, uint seed, int noise)
+{
+    const int i = get_global_id(0);
+    if (i >= L) return;
+    const float sp = fmax((i + 0.5f) * (1.0f / 300.0f) - 0.5f, 0.0f);
+    const int i0 = min((int)sp, T80 - 1), i1 = min(i0 + 1, T80 - 1);
+    const float w = sp - (float)i0;
+    const float uv = F0[i / 300] > 10.0f ? 1.0f : 0.0f;
+    const float namp = uv * 0.003f + (1.0f - uv) * (0.1f / 3.0f);
+    float acc = 0.0f;
+    for (int h = 0; h < 9; h++) {
+        const float a = PH[i0 * 9 + h] * 300.0f, b = PH[i1 * 9 + h] * 300.0f;
+        float v = sin(a * (1.0f - w) + b * w) * 0.1f * uv;
+        if (noise) v += namp * gauss((uint)(i * 9 + h), seed);
+        acc += v * linw[h];
+    }
+    SRC[i] = tanh(acc + linb);
+}
+
+// STFT n_fft=20 hop=5 hann, center (reflect) -> H[frame][0..10]=|X|, [11..21]=angle(X), rest 0
+__kernel void stft(__global const float* SRC, int L, __global half* H, int nfr)
+{
+    const int j = get_global_id(0);
+    if (j >= nfr) return;
+    float xr[20];
+    for (int t = 0; t < 20; t++) {
+        int m = 5 * j + t - 10;
+        m = m < 0 ? -m : (m >= L ? 2 * (L - 1) - m : m);
+        const float win = 0.5f - 0.5f * cos(6.283185307f * t / 20.0f);
+        xr[t] = SRC[m] * win;
+    }
+    __global half* o = H + (size_t)j * 32;
+    for (int k = 0; k < 11; k++) {
+        float re = 0.0f, im = 0.0f;
+        for (int t = 0; t < 20; t++) {
+            const float ang = 6.283185307f * (float)((k * t) % 20) / 20.0f;
+            re += xr[t] * cos(ang);
+            im -= xr[t] * sin(ang);
+        }
+        o[k] = (half)sqrt(re * re + im * im);
+        o[11 + k] = (half)atan2(im, re);
+    }
+    for (int k = 22; k < 32; k++) o[k] = (half)0.0f;
+}
+
+// conv_post output P[frame][24] (x) -> mag=exp(x[0:11]), phase=sin(x[11:22]) -> iSTFT (center, hann) y[n]
+__kernel void istft(__global const half* P, int nfr, __global float* Y, int N)
+{
+    const int n = get_global_id(0);
+    if (n >= N) return;
+    const int pn = n + 10;  // index in the padded signal
+    const int j0 = max(0, (pn - 19 + 4) / 5), j1 = min(nfr - 1, pn / 5);
+    float ola = 0.0f, env = 0.0f;
+    for (int j = j0; j <= j1; j++) {
+        const int m = pn - 5 * j;
+        if (m < 0 || m >= 20) continue;
+        __global const half* x = P + (size_t)j * 24;
+        float v = exp((float)x[0]) * cos(sin((float)x[11]));                      // k = 0 (real part only)
+        v += exp((float)x[10]) * cos(sin((float)x[21])) * ((m & 1) ? -1.0f : 1.0f); // k = 10
+        for (int k = 1; k < 10; k++) {
+            const float mag = exp((float)x[k]), ph = sin((float)x[11 + k]);
+            v += 2.0f * mag * cos(ph + 6.283185307f * (float)((k * m) % 20) / 20.0f);
+        }
+        v *= 1.0f / 20.0f;
+        const float win = 0.5f - 0.5f * cos(6.283185307f * m / 20.0f);
+        ola += win * v;
+        env += win * win;
+    }
+    Y[n] = env > 1e-11f ? ola / env : 0.0f;
+}
+
 // Y = a*Y + b*X
 __kernel void axpby(__global half* Y, __global const half* X, int ld, float a, float b)
 {
@@ -425,11 +509,15 @@ class KDecoder:
             self.conv_k[mb] = prg.conv_dpas
             self.conv_ks[mb] = cl.Program(self.ctx, SRC).build(options=opts + ["-DSTATS"]).conv_dpas
         self.prg = prg
+        # DSP kernels need exact sin/cos (the harmonic source evaluates sin at ~1e5 rad):
+        # built without -cl-fast-relaxed-math
+        self.prg_dsp = cl.Program(self.ctx, SRC).build(options=["-DMB=1"])
         self.k_stats_part, self.k_stats_fin = prg.stats_part, prg.stats_fin
         self.k_normact, self.k_dwup2 = prg.normact, prg.dwup2
         self.k_axpby, self.k_reflect = prg.axpby, prg.reflect_fix
         self.dummy = self.upload(np.zeros(16, np.float16))
         self._sites = {}
+        self._ns = "dec"
         self.min_sg = 1024
         self.sleep_wait = 0.0005
         self.events = None
@@ -439,6 +527,8 @@ class KDecoder:
         self.conv_prg_s = {mb: self.conv_ks[mb].program for mb in self.conv_ks}
         self.S3 = [cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE, 2 * 256 * 4) for _ in range(3)]
         self._build(sd)
+        if (HERE / "f0n_weights.npz").exists():
+            self.load_f0n()
         # keep only what run() needs on the host; the rest now lives on the GPU
         keep = ("F0_conv.weight", "F0_conv.bias", "N_conv.weight", "N_conv.bias", "asr_res.0.weight", "asr_res.0.bias")
         self.sd = {k: sd[k] for k in keep}
@@ -452,7 +542,7 @@ class KDecoder:
     # new utterance only re-sets the few length-dependent integers (pyopencl's __call__
     # costs ~110 us/launch setting all args; set_arg + enqueue is a few us).
     def launch(self, prg, kname, gsz, lsz, *args):
-        i = self._site
+        i = (self._ns, self._site)
         self._site += 1
         st = self._sites.get(i)
         if st is None or st[0] != (id(prg), kname):
@@ -552,9 +642,9 @@ class KDecoder:
         assert nrows * 2 * Cs * 4 <= self.P.size
         self.launch(self.prg, "stats_fin", (2 * Cs // 8 * 64,), (64,), self.P, np.int32(nrows), S, np.int32(Cs))
 
-    def normact(self, X, T, ldx, Y, ldy, Cs, norm=None, act=0, slope=0.0, iscale=1.0, S=None):
+    def normact(self, X, T, ldx, Y, ldy, Cs, norm=None, act=0, slope=0.0, iscale=1.0, S=None, GB=None):
         self.launch(self.prg, "normact", (Cs // 8, T), None, X, np.int32(ldx), Y, np.int32(ldy), S or self.S, np.int32(Cs),
-                       np.float32(1.0 / T), self.GBbuf, np.int32(norm.goff if norm else 0),
+                       np.float32(1.0 / T), GB or self.GBbuf, np.int32(norm.goff if norm else 0),
                        np.int32(norm is not None), np.int32(act), np.float32(slope),
                        norm.alpha if norm else self.dummy, np.float32(iscale))
 
@@ -594,11 +684,13 @@ class KDecoder:
             cur, Scur = out, self.S
 
     # ------------------------------------------------------------------ forward
-    def run(self, asr, f0, n, s, har):
-        """asr [512,F], f0/n [2F], s [128] (decoder half of the style), har [22,120F+1]
-        -> mag, phase [11, 120F+1] (float32, host)."""
+    def run(self, asr, f0, n, s, har=None, source=None, out="spec"):
+        """asr [512,F], f0/n [2F], s [128] (decoder half of the style).
+        har [22,120F+1] (or [120F+1,32] fp16) from the host, or source=(lin_w, lin_b, seed, noise)
+        to build the harmonic source + STFT on the GPU.
+        out="spec": mag, phase [11, 120F+1] (host float32); out="audio": waveform [600F] via GPU iSTFT."""
         sd = self.sd
-        self._site = 0
+        self._site, self._ns = 0, "dec"
         F = asr.shape[1]
         assert F <= MAXF, f"{F} frames > MAXF={MAXF}"
         T80, T800, T4800 = 2 * F, 20 * F, 120 * F + 1
@@ -626,11 +718,30 @@ class KDecoder:
         Db = [self.buf("D0", F, 1104), self.buf("D1", F, 1104)]
         cl.enqueue_copy(self.q, Db[0], D, is_blocking=False)
         cl.enqueue_copy(self.q, Db[1], Db[0], byte_count=D.nbytes)  # device-side duplicate
-        if har.shape == (T4800, 32) and har.dtype == np.float16:
-            H = har  # already in kernel layout (dsp.harmonic_source(..., layout="tc"))
+        Hb = self.buf("har", T4800, 32)
+        if har is None:
+            # harmonic source + STFT on the GPU; host only builds the 80 Hz phase table
+            lin_w, lin_b, seed, noise = source
+            f0f = f0.astype(np.float32)
+            h9 = np.arange(1, 10, dtype=np.float32)
+            rad = (f0f[:, None] * h9[None] / np.float32(24000)) % np.float32(1.0)
+            PH = (np.cumsum(rad, axis=0, dtype=np.float32) * np.float32(2 * np.pi)).astype(np.float32)
+            PHb = self.buf("src_ph", T80 * 9 * 2, 1); cl.enqueue_copy(self.q, PHb, PH, is_blocking=False)
+            F0b = self.buf("src_f0", T80 * 2, 1); cl.enqueue_copy(self.q, F0b, f0f, is_blocking=False)
+            if not hasattr(self, "_linw"):
+                self._linw = self.upload(lin_w.astype(np.float32))
+            L = 600 * F
+            SRCb = self.buf("src", L * 2, 1)
+            self.launch(self.prg_dsp, "source", ((L + 63) // 64 * 64,), (64,), PHb, F0b, np.int32(T80), SRCb,
+                        np.int32(L), self._linw, np.float32(lin_b), np.uint32(seed), np.int32(noise))
+            self.launch(self.prg_dsp, "stft", ((T4800 + 63) // 64 * 64,), (64,), SRCb, np.int32(L), Hb, np.int32(T4800))
+            H = (PH, f0f)
         else:
-            H = np.zeros((T4800, 32), np.float16); H[:, :22] = har.T
-        Hb = self.buf("har", T4800, 32); cl.enqueue_copy(self.q, Hb, H, is_blocking=False)
+            if har.shape == (T4800, 32) and har.dtype == np.float16:
+                H = har  # already in kernel layout (dsp.harmonic_source(..., layout="tc"))
+            else:
+                H = np.zeros((T4800, 32), np.float16); H[:, :22] = har.T
+            cl.enqueue_copy(self.q, Hb, H, is_blocking=False)
         self._host_keep = (E, D, H)
 
         self.t_prep_done = __import__("time").perf_counter()
@@ -694,9 +805,16 @@ class KDecoder:
         self.normact(acc1, T4800, 128, a2, 128, 128, None, act=1, slope=0.01, iscale=1 / 3)
         P = self.buf("post", T4800, 24)
         self.conv_post(self, a2, T4800, 128, P, T4800, 24)
+        if out == "audio":
+            N = 600 * F
+            Yb = self.buf("audio", N * 2, 1)
+            self.launch(self.prg_dsp, "istft", ((N + 63) // 64 * 64,), (64,), P, np.int32(T4800), Yb, np.int32(N))
+            res = np.empty(N, np.float32)
+            ev = cl.enqueue_copy(self.q, res, Yb, is_blocking=False)
+        else:
+            res = np.empty((T4800, 24), np.float16)
+            ev = cl.enqueue_copy(self.q, res, P, is_blocking=False)
         self.t_enq_done = __import__("time").perf_counter()
-        out = np.empty((T4800, 24), np.float16)
-        ev = cl.enqueue_copy(self.q, out, P, is_blocking=False)
         self.q.flush()
         if self.sleep_wait:  # don't spin a CPU core while the GPU works (shared package power)
             import time as _t
@@ -704,8 +822,102 @@ class KDecoder:
                 _t.sleep(self.sleep_wait)
         ev.wait()
         self.t_gpu_done = __import__("time").perf_counter()
-        o = out[:, :22].astype(np.float32).T
+        if out == "audio":
+            return res
+        o = res[:, :22].astype(np.float32).T
         return np.exp(o[:11]), np.sin(o[11:])
+
+    # ------------------------------------------------------------------ F0/N predictor stacks
+    def load_f0n(self, path=HERE / "f0n_weights.npz"):
+        sd = {k: v for k, v in np.load(path).items()}
+        norms = []
+
+        def blk(p, cin, cout, up):
+            n1, n2 = Norm(self, sd, p + ".norm1", cin), Norm(self, sd, p + ".norm2", cout)
+            norms.extend([n1, n2])
+            b = dict(n1=n1, n2=n2, up=up, c1=Conv(self, sd[p + ".conv1.weight"], sd[p + ".conv1.bias"]),
+                     c2=Conv(self, sd[p + ".conv2.weight"], sd[p + ".conv2.bias"]),
+                     sc=Conv(self, sd[p + ".conv1x1.weight"], None) if p + ".conv1x1.weight" in sd else None)
+            if up:
+                W3 = np.ascontiguousarray(sd[p + ".pool.weight"][:, 0, :].T.astype(np.float32))  # [3, cin]
+                b["pw"], b["pb"] = self.upload(W3), self.upload(sd[p + ".pool.bias"].astype(np.float32))
+            return b
+
+        self.f0n_stacks = {}
+        for name in ("F0", "N"):
+            self.f0n_stacks[name] = ([blk(f"{name}.0", 512, 512, False), blk(f"{name}.1", 512, 256, True),
+                                      blk(f"{name}.2", 256, 256, False)],
+                                     Conv(self, sd[f"{name}_proj.weight"], sd[f"{name}_proj.bias"]))
+        off = 0
+        for nm in norms:
+            nm.goff = off
+            off += 2 * nm.Cs
+        self.f0n_norms, self.f0n_gb_len = norms, off
+        self.f0n_fcW = np.concatenate([nm.fcW for nm in norms]).astype(np.float32)
+        self.f0n_fcb = np.concatenate([nm.fcb for nm in norms]).astype(np.float32)
+        for nm in norms:
+            nm.fcW = nm.fcb = None
+        self.f0n_GB = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY, off * 4)
+
+    def resblk(self, b, X, T, ldx, Y, ldy, Cout, GB, tag):
+        """AdainResBlk1d (leaky 0.2), optional x2 upsample, identity or 1x1 shortcut."""
+        up = b["up"]
+        T2 = 2 * T if up else T
+        t1 = self.buf(f"{tag}t1", T, ldx)
+        self.stats(X, T, ldx, ldx)
+        self.normact(X, T, ldx, t1, ldx, ldx, b["n1"], act=1, slope=0.2, GB=GB)
+        src = t1
+        if up:
+            src = self.buf(f"{tag}t1u", T2, ldx)
+            self.launch(self.prg, "dwup2", (ldx // 8, T), None, t1, np.int32(T), np.int32(ldx), src, b["pw"],
+                        np.int32(ldx), b["pb"])
+        h = self.buf(f"{tag}h", T2, Cout)
+        b["c1"](self, src, T2, ldx, h, T2, Cout)
+        self.stats(h, T2, Cout, Cout)
+        t2 = self.buf(f"{tag}t2", T2, Cout)
+        self.normact(h, T2, Cout, t2, Cout, Cout, b["n2"], act=1, slope=0.2, GB=GB)
+        if b["sc"] is not None:
+            sc = self.buf(f"{tag}sc", T, Cout)
+            b["sc"](self, X, T, ldx, sc, T, Cout)
+            R, ldr = sc, Cout
+        else:
+            R, ldr = X, ldx
+        b["c2"](self, t2, T2, Cout, Y, T2, ldy, R=R, ldr=ldr, rdiv=2 if up else 1, rscale=1.0, oscale=1 / math.sqrt(2))
+
+    def f0n(self, x, s):
+        """x: shared-LSTM output [F, 512] (time-major), s: prosody style [128] -> f0, n [2F] (host)."""
+        self._site, self._ns = 0, "f0n"
+        F = x.shape[0]
+        h = self.f0n_fcW @ s.astype(np.float32) + self.f0n_fcb
+        GB = np.zeros(self.f0n_gb_len, np.float32)
+        o = 0
+        for nm in self.f0n_norms:
+            gamma, beta = h[o: o + nm.C], h[o + nm.C: o + 2 * nm.C]
+            o += 2 * nm.C
+            GB[nm.goff: nm.goff + nm.C] = (1 + gamma) * nm.nw
+            GB[nm.goff + nm.Cs: nm.goff + nm.Cs + nm.C] = (1 + gamma) * nm.nb + beta
+        cl.enqueue_copy(self.q, self.f0n_GB, GB, is_blocking=False)
+        Xb = self.buf("f0n_x", F, 512)
+        xh = np.ascontiguousarray(x, dtype=np.float16)
+        cl.enqueue_copy(self.q, Xb, xh, is_blocking=False)
+        outs = []
+        for name in ("F0", "N"):
+            blocks, proj = self.f0n_stacks[name]
+            a = self.buf(f"f0n_{name}a", F, 512)
+            self.resblk(blocks[0], Xb, F, 512, a, 512, 512, self.f0n_GB, "f0n_b0")
+            b2 = self.buf(f"f0n_{name}b", 2 * F, 256)
+            self.resblk(blocks[1], a, F, 512, b2, 256, 256, self.f0n_GB, "f0n_b1")
+            c = self.buf(f"f0n_{name}c", 2 * F, 256)
+            self.resblk(blocks[2], b2, 2 * F, 256, c, 256, 256, self.f0n_GB, "f0n_b2")
+            pr = self.buf(f"f0n_{name}p", 2 * F, 8)
+            proj(self, c, 2 * F, 256, pr, 2 * F, 8)
+            outs.append(pr)
+        res = [np.empty((2 * F, 8), np.float16) for _ in outs]
+        for r, b_ in zip(res, outs):
+            cl.enqueue_copy(self.q, r, b_, is_blocking=False)
+        self.q.finish()
+        self._host_keep_f0n = (GB, xh)
+        return res[0][:, 0].astype(np.float32), res[1][:, 0].astype(np.float32)
 
     def reserve(self, F):
         z = np.zeros

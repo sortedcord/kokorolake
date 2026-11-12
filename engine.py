@@ -71,10 +71,17 @@ class Engine:
             self.dec = {F: comp(f"decoder_F{F}", dec_dev).create_infer_request() for F in dec_buckets}
         # small LSTM graphs: OpenVINO's automatic threading spins ~14 cores for a few ms of
         # work (f0n: 26 ms wall / 181 ms CPU); 4 threads is fastest (9 ms / 35 ms CPU).
-        cpu_cfg = dict(hint, INFERENCE_NUM_THREADS=4) if cpu_dev == "CPU" else hint
+        nthr = int(os.environ.get("KOKORO_CPU_THREADS", "2"))  # measured best: 2 (82 ms TTFT, 258 mJ/audio-s)
+        cpu_cfg = dict(hint, INFERENCE_NUM_THREADS=nthr) if cpu_dev == "CPU" else hint
         compc = lambda name: self.core.compile_model(self.core.read_model(models / f"{name}.xml"), cpu_dev, cpu_cfg)
         self.pros = compc("prosody").create_infer_request()
-        self.f0n = compc("f0n").create_infer_request()
+        # F0/N predictor: "cpu" = whole OpenVINO graph on CPU; "gpu" = shared LSTM on CPU, the six
+        # AdainResBlk1d blocks on the custom GPU kernels (less CPU energy, ~3 ms more latency)
+        self.f0n_mode = os.environ.get("KOKORO_F0N", "gpu") if dec_dev == "custom" else "cpu"
+        if self.f0n_mode == "gpu":
+            self.f0n_lstm = compc("f0n_lstm").create_infer_request()
+        else:
+            self.f0n = compc("f0n").create_infer_request()
         self.tenc = compc("textenc").create_infer_request()
         self.load_s = time.perf_counter() - t
         a = np.load(models / "assets.npz")
@@ -146,16 +153,17 @@ class Engine:
         Fr = int(pd.sum())
         idx = np.repeat(np.arange(L), pd)
         en = np.ascontiguousarray(d[0].T[:, idx][None])  # d^T @ aln == gather
-        r = self.f0n.infer([en, s_pros])
-        f0, n = r[0], r[1]
+        if self.f0n_mode == "gpu" and self.custom:
+            x = self.f0n_lstm.infer([en])[0][0]
+            f0, n = self.kdec.f0n(x, s_pros[0])
+            f0, n = f0[None], n[None]
+        else:
+            r = self.f0n.infer([en, s_pros])
+            f0, n = r[0], r[1]
         self.tenc.wait()
         t_en = self.tenc.get_output_tensor(0).data
         asr = np.ascontiguousarray(t_en[:, :, idx])
         tk("cpu_lstm", t)
-
-        t = time.perf_counter()
-        har = dsp.harmonic_source(f0[0], self.lin_w, self.lin_b, rng=self.rng, layout="tc" if self.custom else "ct")
-        tk("source", t)
 
         if self.custom:
             if Fr > self.dec_buckets[0]:  # longer than the decoder's buffers: split at a pause
@@ -163,14 +171,17 @@ class Engine:
                 ya, pa = self.synth_phonemes(a, speed, T)
                 yb, pb = self.synth_phonemes(b, speed, T)
                 return np.concatenate([ya, yb]), np.concatenate([pa, pb])
+            # harmonic source, STFT, decoder, iSTFT all on the GPU; host gets the waveform
             t = time.perf_counter()
-            mag, ph = self.kdec.run(asr[0], f0[0], n[0], s_dec[0], har)
+            seed = int(self.rng.integers(1, 2**31))
+            audio = self.kdec.run(asr[0], f0[0], n[0], s_dec[0], source=(self.lin_w, self.lin_b, seed, 1), out="audio")
             tk("decoder", t)
-            t = time.perf_counter()
-            audio = dsp.istft(mag.astype(np.float64), ph.astype(np.float64))
-            tk("istft", t)
             T["frames"], T["bucket"] = Fr, "exact"
             return audio, pd
+
+        t = time.perf_counter()
+        har = dsp.harmonic_source(f0[0], self.lin_w, self.lin_b, rng=self.rng)
+        tk("source", t)
 
         t = time.perf_counter()
         Fb = _bucket(Fr, self.dec_buckets)
