@@ -43,6 +43,27 @@ Time to first audio ~85-105 ms, ~330 mJ per second of audio (Piper amy-medium: ~
 - Updating the Quickshell island at request start competed with synthesis; it now
   updates when the first audio is ready.
 
+## Platform tuning (Core Ultra 5 225H)
+
+Measured on the full 14 s passage, energy = package RAPL minus idle:
+
+| Change | TTFT | Energy / audio-s | CPU time |
+|---|---|---|---|
+| v2 baseline | 92 ms | 355 mJ | 755 ms |
+| harmonic source + STFT + iSTFT on the iGPU (`source`/`stft`/`istft` kernels, exact fp32 sin) | 87 ms | 306 mJ | 670 ms |
+| F0/N predictor's six AdainResBlk1d blocks on the iGPU (shared LSTM stays on CPU) | 85 ms | 281 mJ | 507 ms |
+| OpenVINO CPU threads 4 -> 2 | 82 ms | 258 mJ | 397 ms |
+
+Tried and dropped (no gain or worse):
+- pinning to E-cores (4-11): same latency, energy within noise; LP-E cores (12-13):
+  OpenVINO's CPU plugin refuses them
+- GuC SLPC knobs (ignore efficient freq, min freq 1600 MHz): no effect, the iGPU is held
+  at ~1 GHz by PL4 on the USB-C charger
+- cl_khr_throttle_hints / cl_khr_priority_hints queues: within noise
+- PL-BERT on the custom kernels (`KDecoder.bert`, correct to 3e-3): 21-29 ms vs 6.5-8.4 ms
+  for OpenVINO's GPU plugin (tiny-M matmuls are latency-bound in this conv kernel)
+- PL-BERT on the NPU: slower (10.7 ms) and +416 MB vs +225 MB on the GPU
+
 ## Placement study (v1, OpenVINO only)
 
 | Stage | Device | Why |

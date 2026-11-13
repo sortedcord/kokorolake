@@ -360,6 +360,58 @@ __kernel void istft(__global const half* P, int nfr, __global float* Y, int N)
     Y[n] = env > 1e-11f ? ola / env : 0.0f;
 }
 
+
+// ---------------------------------------------------------------- ALBERT pieces
+// attention for one (query i, head h): online softmax over all L keys (no mask: exact length)
+__kernel void attn(__global const half* QKV, int L, __global half* O)
+{
+    const int i = get_global_id(0), h = get_global_id(1);
+    if (i >= L) return;
+    __global const half* qp = QKV + (size_t)i * 2304 + h * 64;
+    float8 q[8], acc[8];
+    for (int d = 0; d < 8; d++) { q[d] = convert_float8(vload8(d, qp)) * 0.125f; acc[d] = (float8)(0.0f); }
+    float m = -INFINITY, ssum = 0.0f;
+    for (int j = 0; j < L; j++) {
+        __global const half* kp = QKV + (size_t)j * 2304 + 768 + h * 64;
+        __global const half* vp = kp + 768;
+        float8 s8 = (float8)(0.0f);
+        for (int d = 0; d < 8; d++) s8 += q[d] * convert_float8(vload8(d, kp));
+        const float sc = s8.s0 + s8.s1 + s8.s2 + s8.s3 + s8.s4 + s8.s5 + s8.s6 + s8.s7;
+        const float mn = fmax(m, sc);
+        const float a = exp(m - mn), e = exp(sc - mn);
+        ssum = ssum * a + e;
+        for (int d = 0; d < 8; d++) acc[d] = acc[d] * a + e * convert_float8(vload8(d, vp));
+        m = mn;
+    }
+    __global half* op = O + (size_t)i * 768 + h * 64;
+    for (int d = 0; d < 8; d++) vstore_half8(acc[d] / ssum, d, op);
+}
+
+// LayerNorm over C channels of each row (64-lane work-group per row), eps given
+__kernel void layernorm(__global const half* X, __global half* Y, int C, __global const float* g,
+                        __global const float* b, float eps)
+{
+    const int t = get_group_id(0), l = get_local_id(0);
+    __global const half* x = X + (size_t)t * C;
+    float s = 0.0f, ss = 0.0f;
+    for (int c = l; c < C; c += 64) { float v = x[c]; s += v; ss += v * v; }
+    __local float ls[64], lss[64];
+    ls[l] = s; lss[l] = ss;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int w = 32; w > 0; w >>= 1) { if (l < w) { ls[l] += ls[l + w]; lss[l] += lss[l + w]; } barrier(CLK_LOCAL_MEM_FENCE); }
+    const float mean = ls[0] / C, var = fmax(lss[0] / C - mean * mean, 0.0f), r = rsqrt(var + eps);
+    for (int c = l; c < C; c += 64) Y[(size_t)t * C + c] = (half)(((float)x[c] - mean) * r * g[c] + b[c]);
+}
+
+// gelu_new (tanh approximation), in place
+__kernel void gelu(__global half* X)
+{
+    const size_t i = get_global_id(0) * 8;
+    float8 x = convert_float8(vload8(0, X + i));
+    float8 y = 0.5f * x * (1.0f + tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
+    vstore_half8(y, 0, X + i);
+}
+
 // Y = a*Y + b*X
 __kernel void axpby(__global half* Y, __global const half* X, int ld, float a, float b)
 {
@@ -529,6 +581,8 @@ class KDecoder:
         self._build(sd)
         if (HERE / "f0n_weights.npz").exists():
             self.load_f0n()
+        if (HERE / "bert_weights.npz").exists():
+            self.load_bert()
         # keep only what run() needs on the host; the rest now lives on the GPU
         keep = ("F0_conv.weight", "F0_conv.bias", "N_conv.weight", "N_conv.bias", "asr_res.0.weight", "asr_res.0.bias")
         self.sd = {k: sd[k] for k in keep}
@@ -918,6 +972,53 @@ class KDecoder:
         self.q.finish()
         self._host_keep_f0n = (GB, xh)
         return res[0][:, 0].astype(np.float32), res[1][:, 0].astype(np.float32)
+
+    # ------------------------------------------------------------------ PL-BERT (ALBERT)
+    def load_bert(self, path=HERE / "bert_weights.npz"):
+        sd = {k: v for k, v in np.load(path).items()}
+        p = "encoder.albert_layer_groups.0.albert_layers.0."
+        lin = lambda W, b: Conv(self, W[:, :, None], b)
+        self.b_emb = (sd["embeddings.word_embeddings.weight"], sd["embeddings.position_embeddings.weight"],
+                      sd["embeddings.token_type_embeddings.weight"][0], sd["embeddings.LayerNorm.weight"],
+                      sd["embeddings.LayerNorm.bias"])
+        self.b_in = lin(sd["encoder.embedding_hidden_mapping_in.weight"], sd["encoder.embedding_hidden_mapping_in.bias"])
+        self.b_qkv = lin(np.concatenate([sd[p + f"attention.{n}.weight"] for n in ("query", "key", "value")]),
+                         np.concatenate([sd[p + f"attention.{n}.bias"] for n in ("query", "key", "value")]))
+        self.b_dense = lin(sd[p + "attention.dense.weight"], sd[p + "attention.dense.bias"])
+        self.b_ffn = lin(sd[p + "ffn.weight"], sd[p + "ffn.bias"])
+        self.b_ffo = lin(sd[p + "ffn_output.weight"], sd[p + "ffn_output.bias"])
+        self.b_out = lin(sd["bert_encoder.weight"], sd["bert_encoder.bias"])
+        up = lambda a: self.upload(a.astype(np.float32))
+        self.b_ln1 = (up(sd[p + "attention.LayerNorm.weight"]), up(sd[p + "attention.LayerNorm.bias"]))
+        self.b_ln2 = (up(sd[p + "full_layer_layer_norm.weight"]), up(sd[p + "full_layer_layer_norm.bias"]))
+
+    def bert(self, ids):
+        """ids [L] -> d_en [512, L] (host float32). 12 shared ALBERT layers, exact length."""
+        self._site, self._ns = 0, "bert"
+        L = len(ids)
+        wte, wpe, wtt, lg, lb = self.b_emb
+        e = wte[ids] + wpe[:L] + wtt
+        mu, var = e.mean(-1, keepdims=True), e.var(-1, keepdims=True)
+        e = ((e - mu) / np.sqrt(var + 1e-12) * lg + lb).astype(np.float16)
+        Eb = self.buf("b_e", L, 128); cl.enqueue_copy(self.q, Eb, e, is_blocking=False)
+        H = self.buf("b_h", L, 768)
+        self.b_in(self, Eb, L, 128, H, L, 768)
+        QKV, A, H1, Fb = self.buf("b_qkv", L, 2304), self.buf("b_a", L, 768), self.buf("b_h1", L, 768), self.buf("b_f", L, 2048)
+        for _ in range(12):
+            self.b_qkv(self, H, L, 768, QKV, L, 2304)
+            self.launch(self.prg_dsp, "attn", (L, 12), None, QKV, np.int32(L), A)
+            self.b_dense(self, A, L, 768, H1, L, 768, R=H, ldr=768, rscale=1.0)
+            self.launch(self.prg_dsp, "layernorm", (L * 64,), (64,), H1, H1, np.int32(768), *self.b_ln1, np.float32(1e-12))
+            self.b_ffn(self, H1, L, 768, Fb, L, 2048)
+            self.launch(self.prg_dsp, "gelu", (L * 2048 // 8,), None, Fb)
+            self.b_ffo(self, Fb, L, 2048, H, L, 768, R=H1, ldr=768, rscale=1.0)
+            self.launch(self.prg_dsp, "layernorm", (L * 64,), (64,), H, H, np.int32(768), *self.b_ln2, np.float32(1e-12))
+        Ob = self.buf("b_o", L, 512)
+        self.b_out(self, H, L, 768, Ob, L, 512)
+        out = np.empty((L, 512), np.float16)
+        cl.enqueue_copy(self.q, out, Ob)
+        self._keep_bert = e
+        return out.astype(np.float32).T
 
     def reserve(self, F):
         z = np.zeros
