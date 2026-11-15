@@ -9,7 +9,14 @@ fused with the following activation (leaky ReLU or snake).
     mag, phase = KDecoder().run(asr[512,F], f0[2F], n[2F], s[128], har[22,120F+1])
 """
 import math
+import os
 from pathlib import Path
+
+# Intel compute-runtime "direct submission" (ULLS): the GPU polls a ring buffer for new work
+# instead of a kernel-driver submission per batch. ~15% faster decode here (OpenVINO's GPU
+# plugin turns it on implicitly; plain OpenCL queues don't get it). Must precede driver init.
+os.environ.setdefault("NEOReadDebugKeys", "1")
+os.environ.setdefault("EnableDirectSubmission", "1")
 
 import numpy as np
 import pyopencl as cl
@@ -389,7 +396,7 @@ __kernel void attn(__global const half* QKV, int L, __global half* O)
 
 // LayerNorm over C channels of each row (64-lane work-group per row), eps given
 __kernel void layernorm(__global const half* X, __global half* Y, int C, __global const float* g,
-                        __global const float* b, float eps)
+                        __global const float* b, float eps, float leaky)
 {
     const int t = get_group_id(0), l = get_local_id(0);
     __global const half* x = X + (size_t)t * C;
@@ -400,7 +407,11 @@ __kernel void layernorm(__global const half* X, __global half* Y, int C, __globa
     barrier(CLK_LOCAL_MEM_FENCE);
     for (int w = 32; w > 0; w >>= 1) { if (l < w) { ls[l] += ls[l + w]; lss[l] += lss[l + w]; } barrier(CLK_LOCAL_MEM_FENCE); }
     const float mean = ls[0] / C, var = fmax(lss[0] / C - mean * mean, 0.0f), r = rsqrt(var + eps);
-    for (int c = l; c < C; c += 64) Y[(size_t)t * C + c] = (half)(((float)x[c] - mean) * r * g[c] + b[c]);
+    for (int c = l; c < C; c += 64) {
+        float v = ((float)x[c] - mean) * r * g[c] + b[c];
+        if (leaky != 0.0f && v < 0.0f) v *= leaky;
+        Y[(size_t)t * C + c] = (half)v;
+    }
 }
 
 // gelu_new (tanh approximation), in place
@@ -410,6 +421,103 @@ __kernel void gelu(__global half* X)
     float8 x = convert_float8(vload8(0, X + i));
     float8 y = 0.5f * x * (1.0f + tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
     vstore_half8(y, 0, X + i);
+}
+
+
+// ---------------------------------------------------------------- skinny GEMM / conv (few time rows)
+// Work-group = 8 subgroups splitting the reduction (taps x 16-channel blocks); each subgroup keeps
+// NT independent accumulators (one per 8-time block), so DPAS chains interleave. One work-group per
+// 8 output channels x 8*NT times. Partial sums reduced through SLM; fused epilogue:
+// y = act(acc + bias + rscale*R) * oscale.  act: 0 none, 1 leaky(slope), 3 gelu(tanh)
+#ifndef NT
+#define NT 2
+#endif
+#ifndef KS
+#define KS 8
+#endif
+#ifndef UN
+#define UN 4
+#endif
+#ifndef SMB
+#define SMB 2
+#endif
+__attribute__((intel_reqd_sub_group_size(8)))
+__attribute__((reqd_work_group_size(8 * KS, 1, 1)))
+__kernel void skinny(
+    __global const half* X, int Tin, int ldx, int Cin_pad,
+    __global const uint* Wp, __global const float* bias,
+    __global const half* R, int ldr, float rscale,
+    __global half* Y, int Tq, int ldy, int Cout_pad,
+    int K, int dil, int pad, int act, float slope, float oscale)
+{
+    const int lane = get_sub_group_local_id(), sg = get_sub_group_id();
+    const int co0 = get_group_id(0) * 8 * SMB;
+    const int t0 = get_group_id(1) * (8 * NT);
+    const int nci = Cin_pad / 16, nco8 = Cout_pad / 8, total = K * nci;
+    float8 acc[NT][SMB];
+    for (int a = 0; a < NT; a++) for (int m = 0; m < SMB; m++) acc[a][m] = (float8)(0.0f);
+    for (int base = sg; base < total; base += KS * UN) {
+        int8 A[UN][SMB];
+        for (int u = 0; u < UN; u++) {
+            const int it = base + u * KS;
+            const int k = it / nci, cb = it - k * nci;
+            for (int m = 0; m < SMB; m++)
+                A[u][m] = it < total ? as_int8(intel_sub_group_block_read8(
+                              Wp + (((size_t)k * nco8 + co0 / 8 + m) * nci + cb) * 64)) : (int8)(0);
+        }
+        for (int u = 0; u < UN; u++) {
+            const int it = base + u * KS;
+            if (it >= total) break;
+            const int k = it / nci, cb = it - k * nci;
+            for (int a = 0; a < NT; a++) {
+                const int t = t0 + a * 8 + lane;
+                const int tin = t + k * dil - pad;
+                const bool ok = (t < Tq) && (tin >= 0) && (tin < Tin);
+                int8 B = ok ? vload8(0, (__global const int*)(X + (size_t)tin * ldx) + cb * 8) : (int8)(0);
+                for (int m = 0; m < SMB; m++)
+                    acc[a][m] = intel_sub_group_f16_f16_matrix_mad_k16(A[u][m], B, acc[a][m]);
+            }
+        }
+    }
+    __local float red[KS][NT][SMB][8][8];
+    for (int a = 0; a < NT; a++) for (int m = 0; m < SMB; m++) vstore8(acc[a][m], 0, &red[sg][a][m][lane][0]);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int job = get_local_id(0); job < NT * SMB * 8; job += 8 * KS) {
+        const int a = job / (SMB * 8), m = (job / 8) % SMB, tl = job % 8;
+        const int c = co0 + 8 * m;
+        float8 v = vload8(0, bias + c);
+        for (int s = 0; s < KS; s++) v += vload8(0, &red[s][a][m][tl][0]);
+        const int t = t0 + a * 8 + tl;
+        if (t < Tq) {
+            if (rscale != 0.0f) v += rscale * convert_float8(vload8(0, R + (size_t)t * ldr + c));
+            if (act == 1) v = select(v * slope, v, v > 0.0f);
+            else if (act == 3) v = 0.5f * v * (1.0f + tanh(0.7978845608f * (v + 0.044715f * v * v * v)));
+            vstore_half8(v * oscale, 0, Y + (size_t)t * ldy + c);
+        }
+    }
+}
+
+// attention, one subgroup per (query i, head h); lanes hold 8 of the 64 dims
+__attribute__((intel_reqd_sub_group_size(8)))
+__kernel void attn8(__global const half* QKV, int L, __global half* O)
+{
+    const int i = get_global_id(0) / 8, h = get_global_id(1), lane = get_sub_group_local_id();
+    if (i >= L) return;
+    const float8 q = convert_float8(vload8(0, QKV + (size_t)i * 2304 + h * 64 + lane * 8)) * 0.125f;
+    float m = -INFINITY, ssum = 0.0f;
+    float8 acc = (float8)(0.0f);
+    for (int j = 0; j < L; j++) {
+        __global const half* kp = QKV + (size_t)j * 2304 + 768 + h * 64 + lane * 8;
+        const float8 kk = convert_float8(vload8(0, kp));
+        const float8 vv = convert_float8(vload8(0, kp + 768));
+        const float8 p = q * kk;
+        const float sc = sub_group_reduce_add(p.s0 + p.s1 + p.s2 + p.s3 + p.s4 + p.s5 + p.s6 + p.s7);
+        const float mn = fmax(m, sc), al = exp(m - mn), e = exp(sc - mn);
+        ssum = ssum * al + e;
+        acc = acc * al + e * vv;
+        m = mn;
+    }
+    vstore_half8(acc / ssum, 0, O + (size_t)i * 768 + h * 64 + lane * 8);
 }
 
 // Y = a*Y + b*X
@@ -503,6 +611,19 @@ class Conv:
         return g0 // 8
 
 
+def skinny(dec, conv, X, T, ldx, Y, ldy, R=None, ldr=0, rscale=0.0, act=0, slope=0.0, oscale=1.0):
+    """conv on few time rows (T <= a few hundred): split-K work-groups (kernel `skinny`)."""
+    assert conv.stride == 1 and ldx >= conv.Cin_pad and conv.Cout_pad % 16 == 0
+    dec._last_conv = "skinny " + conv.name
+    # defaults NT=2 (16 rows), KS=8 (split-K subgroups), UN=4, SMB=2 (16 channels): tuned on Arc 130T
+    dec.launch(dec.prg, "skinny", (conv.Cout_pad // 16 * 64, (T + 15) // 16), (64, 1),
+               X, np.int32(T), np.int32(ldx), np.int32(conv.Cin_pad), conv.W, conv.b,
+               R if R is not None else dec.dummy, np.int32(ldr), np.float32(rscale),
+               Y, np.int32(T), np.int32(ldy), np.int32(conv.Cout_pad),
+               np.int32(conv.K), np.int32(conv.dil), np.int32(conv.pad), np.int32(act), np.float32(slope),
+               np.float32(oscale))
+
+
 class ConvT:
     """ConvTranspose1d as `stride` polyphase convs writing interleaved output rows."""
 
@@ -569,6 +690,7 @@ class KDecoder:
         self.k_axpby, self.k_reflect = prg.axpby, prg.reflect_fix
         self.dummy = self.upload(np.zeros(16, np.float16))
         self._sites = {}
+        self._z = {}
         self._ns = "dec"
         self.min_sg = 1024
         self.sleep_wait = 0.0005
@@ -613,7 +735,7 @@ class KDecoder:
             cache[j] = a
         ev = cl.enqueue_nd_range_kernel(self.q, k, gsz, lsz)
         if self.events is not None:
-            self.events.append((self._last_conv if kname == "conv_dpas" else kname, ev))
+            self.events.append((self._last_conv if kname in ("conv_dpas", "skinny") else kname, ev))
 
     def upload(self, a):
         return cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=np.ascontiguousarray(a))
@@ -669,11 +791,48 @@ class KDecoder:
         self.GBbuf = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY, off * 4)
         self.S = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE, 2 * 1104 * 4 * 4)  # stats scratch (reused)
         self.Sx = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE, 2 * 1104 * 4 * 4)  # stats of a stage input (kept)
-        self.P = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE, 12 << 20)  # stats partial rows (3 branches at MAXF)
+        # stats partial rows: one row per 8 output times; largest = 120*MAXF+1 rows / 8 x 2 x 128 ch x 4 B
+        rows = ((120 * MAXF + 1 + 7) // 8 + 7) // 8 * 8 + 1  # conv epilogue rows at 4800 Hz (+ reflect row)
+        self.P = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE, max(rows * 2 * 128, 256 * 2 * 1104) * 4 * (3 if GROUPED else 1))
         self._bufs = {}
 
     # ------------------------------------------------------------------ helpers
+    def zbuf(self, name, shape, dtype):
+        """Zero-copy buffer: page-aligned host memory wrapped with CL_MEM_USE_HOST_PTR. The iGPU
+        reads/writes it in place (shared RAM), so host<->GPU transfers are plain numpy writes/reads
+        (~5-20 us) instead of enqueue_copy (~200 us each through pyopencl + the copy engine).
+        Write before enqueueing the kernels that read it; read after waiting for the writers."""
+        nbytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
+        z = self._z.get(name)
+        if z is None or z[2] < nbytes:
+            cap = (max(nbytes, 4096) + 4095) // 4096 * 4096
+            raw = np.empty(cap + 4096, np.uint8)
+            off = (-raw.ctypes.data) % 4096
+            mem = raw[off:off + cap]
+            b = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE | cl.mem_flags.USE_HOST_PTR, hostbuf=mem)
+            z = (b, mem, cap, raw)
+            self._z[name] = z
+        return z[0], z[1][:nbytes].view(dtype).reshape(shape)
+
+    def wait(self):
+        """Wait for all enqueued work; sleep-polls on a marker so no CPU core spins."""
+        ev = cl.enqueue_marker(self.q)
+        self.q.flush()
+        if self.sleep_wait:
+            import time as _t
+            while ev.command_execution_status != cl.command_execution_status.COMPLETE:
+                _t.sleep(self.sleep_wait)
+        ev.wait()
+
+    # Generator-stage activations share 5 physical slots (liveness worked out in run()):
+    # stage 0 (800 Hz x 256 ch) and stage 1 (4800 Hz x 128 ch) each have <= 5 live buffers.
+    ALIAS = {"nc0": "S1", "xs0": "S2", "x0": "S3", "rb_t256": "S4", "rb_h256": "S5", "br0": "S1", "acc0": "S2",
+             "g_act1": "S2",  # normact(acc0 -> g_act1) runs in place
+             "nc1": "S1", "xs1": "S3", "rb_t128": "S4", "rb_h128": "S5", "x1": "S1", "br1": "S2", "acc1": "S3",
+             "g_act2": "S3"}  # normact(acc1 -> g_act2) in place
+
     def buf(self, name, rows, ld):
+        name = self.ALIAS.get(name, name) if not GROUPED else name
         need = rows * ld * 2
         b = self._bufs.get(name)
         if b is None or b.size < need:
@@ -749,14 +908,14 @@ class KDecoder:
         assert F <= MAXF, f"{F} frames > MAXF={MAXF}"
         T80, T800, T4800 = 2 * F, 20 * F, 120 * F + 1
         h = self.fcW_all @ s.astype(np.float32) + self.fcb_all
-        GB = np.zeros(self.gb_len, np.float32)
+        self.GBbuf, GB = self.zbuf("GB", (self.gb_len,), np.float32)
+        GB[:] = 0
         o = 0
         for nm in self.norms:
             gamma, beta = h[o: o + nm.C], h[o + nm.C: o + 2 * nm.C]
             o += 2 * nm.C
             GB[nm.goff: nm.goff + nm.C] = (1 + gamma) * nm.nw
             GB[nm.goff + nm.Cs: nm.goff + nm.Cs + nm.C] = (1 + gamma) * nm.nb + beta
-        cl.enqueue_copy(self.q, self.GBbuf, GB, is_blocking=False)
         # ---- 40 Hz inputs on host: F0/N strided convs, asr_res 1x1
         def c1d_s2(x, w, b):  # Conv1d(1,1,k3,s2,p1)
             xp = np.pad(x, (1, 1))
@@ -764,15 +923,15 @@ class KDecoder:
         F0 = c1d_s2(f0, sd["F0_conv.weight"], sd["F0_conv.bias"])[:F]
         Nn = c1d_s2(n, sd["N_conv.weight"], sd["N_conv.bias"])[:F]
         asr_res = sd["asr_res.0.weight"][:, :, 0] @ asr + sd["asr_res.0.bias"][:, None]  # [64,F]
-        E = np.zeros((F, 528), np.float16)
+        Eb, E = self.zbuf("E", (F, 528), np.float16)
+        E[:] = 0
         E[:, :512] = asr.T; E[:, 512] = F0; E[:, 513] = Nn
-        D = np.zeros((F, 1104), np.float16)
-        D[:, 1024:1088] = asr_res.T; D[:, 1088] = F0; D[:, 1089] = Nn
-        Eb = self.buf("E", F, 528); cl.enqueue_copy(self.q, Eb, E, is_blocking=False)
-        Db = [self.buf("D0", F, 1104), self.buf("D1", F, 1104)]
-        cl.enqueue_copy(self.q, Db[0], D, is_blocking=False)
-        cl.enqueue_copy(self.q, Db[1], Db[0], byte_count=D.nbytes)  # device-side duplicate
-        Hb = self.buf("har", T4800, 32)
+        Db = []
+        for nm_ in ("D0", "D1"):
+            b_, D = self.zbuf(nm_, (F, 1104), np.float16)
+            D[:, 1090:] = 0
+            D[:, 1024:1088] = asr_res.T; D[:, 1088] = F0; D[:, 1089] = Nn
+            Db.append(b_)
         if har is None:
             # harmonic source + STFT on the GPU; host only builds the 80 Hz phase table
             lin_w, lin_b, seed, noise = source
@@ -780,8 +939,9 @@ class KDecoder:
             h9 = np.arange(1, 10, dtype=np.float32)
             rad = (f0f[:, None] * h9[None] / np.float32(24000)) % np.float32(1.0)
             PH = (np.cumsum(rad, axis=0, dtype=np.float32) * np.float32(2 * np.pi)).astype(np.float32)
-            PHb = self.buf("src_ph", T80 * 9 * 2, 1); cl.enqueue_copy(self.q, PHb, PH, is_blocking=False)
-            F0b = self.buf("src_f0", T80 * 2, 1); cl.enqueue_copy(self.q, F0b, f0f, is_blocking=False)
+            PHb, PHz = self.zbuf("src_ph", PH.shape, np.float32); PHz[:] = PH
+            F0b, F0z = self.zbuf("src_f0", f0f.shape, np.float32); F0z[:] = f0f
+            Hb = self.buf("har", T4800, 32)
             if not hasattr(self, "_linw"):
                 self._linw = self.upload(lin_w.astype(np.float32))
             L = 600 * F
@@ -791,12 +951,11 @@ class KDecoder:
             self.launch(self.prg_dsp, "stft", ((T4800 + 63) // 64 * 64,), (64,), SRCb, np.int32(L), Hb, np.int32(T4800))
             H = (PH, f0f)
         else:
+            Hb, H = self.zbuf("har_in", (T4800, 32), np.float16)
             if har.shape == (T4800, 32) and har.dtype == np.float16:
-                H = har  # already in kernel layout (dsp.harmonic_source(..., layout="tc"))
+                H[:] = har  # already in kernel layout (dsp.harmonic_source(..., layout="tc"))
             else:
-                H = np.zeros((T4800, 32), np.float16); H[:, :22] = har.T
-            cl.enqueue_copy(self.q, Hb, H, is_blocking=False)
-        self._host_keep = (E, D, H)
+                H[:] = 0; H[:, :22] = har.T
 
         self.t_prep_done = __import__("time").perf_counter()
         # ---- encode + decode blocks (40 Hz)
@@ -861,20 +1020,15 @@ class KDecoder:
         self.conv_post(self, a2, T4800, 128, P, T4800, 24)
         if out == "audio":
             N = 600 * F
-            Yb = self.buf("audio", N * 2, 1)
+            Yb, Yz = self.zbuf("audio", (N,), np.float32)
             self.launch(self.prg_dsp, "istft", ((N + 63) // 64 * 64,), (64,), P, np.int32(T4800), Yb, np.int32(N))
-            res = np.empty(N, np.float32)
-            ev = cl.enqueue_copy(self.q, res, Yb, is_blocking=False)
+        self.t_enq_done = __import__("time").perf_counter()
+        self.wait()
+        if out == "audio":
+            res = Yz.copy()
         else:
             res = np.empty((T4800, 24), np.float16)
-            ev = cl.enqueue_copy(self.q, res, P, is_blocking=False)
-        self.t_enq_done = __import__("time").perf_counter()
-        self.q.flush()
-        if self.sleep_wait:  # don't spin a CPU core while the GPU works (shared package power)
-            import time as _t
-            while ev.command_execution_status != cl.command_execution_status.COMPLETE:
-                _t.sleep(self.sleep_wait)
-        ev.wait()
+            cl.enqueue_copy(self.q, res, P)
         self.t_gpu_done = __import__("time").perf_counter()
         if out == "audio":
             return res
@@ -950,10 +1104,9 @@ class KDecoder:
             o += 2 * nm.C
             GB[nm.goff: nm.goff + nm.C] = (1 + gamma) * nm.nw
             GB[nm.goff + nm.Cs: nm.goff + nm.Cs + nm.C] = (1 + gamma) * nm.nb + beta
-        cl.enqueue_copy(self.q, self.f0n_GB, GB, is_blocking=False)
-        Xb = self.buf("f0n_x", F, 512)
-        xh = np.ascontiguousarray(x, dtype=np.float16)
-        cl.enqueue_copy(self.q, Xb, xh, is_blocking=False)
+        self.f0n_GB, GBz = self.zbuf("f0n_GB", GB.shape, np.float32); GBz[:] = GB
+        Xb, Xz = self.zbuf("f0n_x", (F, 512), np.float16); Xz[:] = x
+        xh = None
         outs = []
         for name in ("F0", "N"):
             blocks, proj = self.f0n_stacks[name]
@@ -963,13 +1116,11 @@ class KDecoder:
             self.resblk(blocks[1], a, F, 512, b2, 256, 256, self.f0n_GB, "f0n_b1")
             c = self.buf(f"f0n_{name}c", 2 * F, 256)
             self.resblk(blocks[2], b2, 2 * F, 256, c, 256, 256, self.f0n_GB, "f0n_b2")
-            pr = self.buf(f"f0n_{name}p", 2 * F, 8)
+            pr, prz = self.zbuf(f"f0n_{name}p", (2 * F, 8), np.float16)
             proj(self, c, 2 * F, 256, pr, 2 * F, 8)
-            outs.append(pr)
-        res = [np.empty((2 * F, 8), np.float16) for _ in outs]
-        for r, b_ in zip(res, outs):
-            cl.enqueue_copy(self.q, r, b_, is_blocking=False)
-        self.q.finish()
+            outs.append(prz)
+        self.wait()
+        res = outs
         self._host_keep_f0n = (GB, xh)
         return res[0][:, 0].astype(np.float32), res[1][:, 0].astype(np.float32)
 
@@ -992,31 +1143,34 @@ class KDecoder:
         self.b_ln1 = (up(sd[p + "attention.LayerNorm.weight"]), up(sd[p + "attention.LayerNorm.bias"]))
         self.b_ln2 = (up(sd[p + "full_layer_layer_norm.weight"]), up(sd[p + "full_layer_layer_norm.bias"]))
 
-    def bert(self, ids):
-        """ids [L] -> d_en [512, L] (host float32). 12 shared ALBERT layers, exact length."""
+    def bert(self, ids, readback=True):
+        """ids [L] -> d_en [512, L] (host float32), or the GPU buffer [L, 512] fp16 if not readback.
+        12 shared ALBERT layers, exact length."""
         self._site, self._ns = 0, "bert"
         L = len(ids)
         wte, wpe, wtt, lg, lb = self.b_emb
         e = wte[ids] + wpe[:L] + wtt
         mu, var = e.mean(-1, keepdims=True), e.var(-1, keepdims=True)
-        e = ((e - mu) / np.sqrt(var + 1e-12) * lg + lb).astype(np.float16)
-        Eb = self.buf("b_e", L, 128); cl.enqueue_copy(self.q, Eb, e, is_blocking=False)
+        Eb, ez = self.zbuf("b_e", (L, 128), np.float16)
+        ez[:] = (e - mu) / np.sqrt(var + 1e-12) * lg + lb
+        e = None
         H = self.buf("b_h", L, 768)
-        self.b_in(self, Eb, L, 128, H, L, 768)
+        skinny(self, self.b_in, Eb, L, 128, H, 768)
         QKV, A, H1, Fb = self.buf("b_qkv", L, 2304), self.buf("b_a", L, 768), self.buf("b_h1", L, 768), self.buf("b_f", L, 2048)
         for _ in range(12):
-            self.b_qkv(self, H, L, 768, QKV, L, 2304)
-            self.launch(self.prg_dsp, "attn", (L, 12), None, QKV, np.int32(L), A)
-            self.b_dense(self, A, L, 768, H1, L, 768, R=H, ldr=768, rscale=1.0)
-            self.launch(self.prg_dsp, "layernorm", (L * 64,), (64,), H1, H1, np.int32(768), *self.b_ln1, np.float32(1e-12))
-            self.b_ffn(self, H1, L, 768, Fb, L, 2048)
-            self.launch(self.prg_dsp, "gelu", (L * 2048 // 8,), None, Fb)
-            self.b_ffo(self, Fb, L, 2048, H, L, 768, R=H1, ldr=768, rscale=1.0)
-            self.launch(self.prg_dsp, "layernorm", (L * 64,), (64,), H, H, np.int32(768), *self.b_ln2, np.float32(1e-12))
-        Ob = self.buf("b_o", L, 512)
-        self.b_out(self, H, L, 768, Ob, L, 512)
-        out = np.empty((L, 512), np.float16)
-        cl.enqueue_copy(self.q, out, Ob)
+            skinny(self, self.b_qkv, H, L, 768, QKV, 2304)
+            self.launch(self.prg_dsp, "attn8", (L * 8, 12), (8, 1), QKV, np.int32(L), A)
+            skinny(self, self.b_dense, A, L, 768, H1, 768, R=H, ldr=768, rscale=1.0)
+            self.launch(self.prg_dsp, "layernorm", (L * 64,), (64,), H1, H1, np.int32(768), *self.b_ln1, np.float32(1e-12), np.float32(0))
+            skinny(self, self.b_ffn, H1, L, 768, Fb, 2048, act=3)
+            skinny(self, self.b_ffo, Fb, L, 2048, H, 768, R=H1, ldr=768, rscale=1.0)
+            self.launch(self.prg_dsp, "layernorm", (L * 64,), (64,), H, H, np.int32(768), *self.b_ln2, np.float32(1e-12), np.float32(0))
+        Ob, Oz = self.zbuf("b_o", (L, 512), np.float16)
+        skinny(self, self.b_out, H, L, 768, Ob, 512)
+        if not readback:
+            return Ob
+        self.wait()
+        out = Oz
         self._keep_bert = e
         return out.astype(np.float32).T
 

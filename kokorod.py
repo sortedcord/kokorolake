@@ -118,17 +118,10 @@ class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--socket", default=str(RUNTIME / "ttsd.sock"))
-    ap.add_argument("--device", default=os.environ.get("KOKORO_DEVICE", "GPU"), help="BERT device")
-    ap.add_argument("--decoder", default=os.environ.get("KOKORO_DECODER", "custom"),
-                    help='"custom" (OpenCL/XMX kernels) or an OpenVINO device')
     args = ap.parse_args()
 
     t = time.perf_counter()
-    try:
-        eng = Engine(bert_dev=args.device, dec_dev=args.decoder)
-    except Exception as ex:
-        log(f"{args.device}/{args.decoder} failed ({ex}); falling back to CPU")
-        eng = Engine(bert_dev="CPU", dec_dev="CPU")
+    eng = Engine()
     log(f"engine ready in {time.perf_counter() - t:.1f}s")
     sp = Speaker(eng)
 

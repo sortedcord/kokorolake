@@ -4,7 +4,34 @@ Custom inference for [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) on 
 Intel Core Ultra 5 225H (Arrow Lake: Arc 130T/140T iGPU, NPU 3720, 14-core CPU) with
 OpenVINO. Goal: lowest time-to-first-audio, then energy, keeping Kokoro's sound.
 
-## Current pipeline (v2)
+## Current pipeline (v3: no OpenVINO, no torch at runtime)
+
+| Stage | Where |
+|---|---|
+| G2P: misaki with a compact lexicon + slim spaCy (`g2p_lean.py`, identical phonemes) | CPU |
+| text encoder: convs + LSTM input gates as skinny XMX GEMMs, LSTM recurrence in Rust (thread, overlaps BERT) | iGPU + CPU |
+| PL-BERT (ALBERT, 12 shared layers): skinny split-K XMX GEMMs + subgroup attention (`KDecoder.bert`) | iGPU |
+| prosody LSTMs: gates on the iGPU, recurrences in Rust (`rs/`, AVX2/F16C) | iGPU + CPU |
+| F0/N blocks, harmonic source, STFT, decoder, generator, iSTFT | iGPU |
+
+Memory (RSS + GPU allocations): **~480 MB** (v2 with OpenVINO: ~1.28 GB). TTFT ~80-85 ms.
+
+What freed the memory:
+- OpenVINO removed: its GPU plugin for BERT (~400 MB incl. GPU heaps) and CPU plugin for the
+  LSTMs (~170 MB). BERT now runs on the custom kernels; the LSTMs are GEMM (iGPU) + recurrence (Rust).
+- misaki lexicon dicts (365k Python entries, 59 MB) -> one UTF-8 blob + offsets, binary search
+  (cached in `models/lexicon_us.npz`); spaCy parser/NER/lemmatizer excluded, not just disabled.
+- generator activations share 5 slots by liveness (stage 0 and 1), exact-size stats partials.
+- malloc_trim after load (heap temporaries from weight packing).
+
+Platform features that made the OpenVINO-free path fast:
+- **zero-copy buffers** (`KDecoder.zbuf`, `CL_MEM_USE_HOST_PTR` on page-aligned memory): the iGPU
+  shares RAM, so uploads/readbacks are plain memory writes. A write->kernel->read round trip is
+  18 us vs 430 us with enqueue_copy (pyopencl's non-blocking enqueue_copy alone costs ~230 us).
+- **direct submission (ULLS)** in Intel's compute runtime (`EnableDirectSubmission=1`): ~15% faster
+  decode. OpenVINO's GPU plugin had been enabling it implicitly.
+
+## v2 pipeline (OpenVINO for BERT + LSTMs)
 
 | Stage | Where | First-chunk time |
 |---|---|---|

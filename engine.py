@@ -1,17 +1,15 @@
-"""Kokoro-82M inference engine on OpenVINO with per-stage device placement.
+"""Kokoro-82M runtime for Intel Core Ultra (Arrow Lake) iGPU + CPU. No OpenVINO, no torch.
 
-    text -> misaki G2P (CPU) -> ids
-         -> BERT (GPU, token buckets)              -> d_en
-         -> prosody LSTMs (CPU, dynamic)           -> d, durations
-         -> alignment (numpy)
-         -> F0/N predictor (CPU, dynamic)          -> f0, n
-         -> text encoder (CPU, dynamic)            -> t_en -> asr
-         -> harmonic source + STFT (numpy)         -> har
-         -> decoder/vocoder (GPU, frame buckets)   -> mag, phase
-         -> iSTFT (numpy)                          -> 24 kHz audio
+    text -> misaki G2P (CPU)                                  -> ids
+         -> text encoder: numpy convs + Rust LSTM (CPU thread, overlaps BERT)
+         -> PL-BERT: custom OpenCL kernels (iGPU, XMX)        -> d_en
+         -> prosody LSTMs: numpy GEMM + Rust recurrence (CPU) -> d, durations
+         -> alignment (numpy gather)
+         -> shared LSTM (CPU) -> F0/N blocks (iGPU)           -> f0, n
+         -> harmonic source, STFT, decoder, iGPU iSTFT         -> 24 kHz audio
 
-No torch at runtime. Text is split into sentence/clause chunks; the first chunk is
-kept short so audio can start as early as possible (stream()).
+Text is split into sentence/clause chunks; the first chunk is kept short so audio can
+start as early as possible (stream()).
 """
 import os
 
@@ -20,89 +18,52 @@ import os
 for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ.setdefault(_v, "1")
 
+import ctypes
 import json
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 
 import numpy as np
-import openvino as ov
-
-import dsp
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE / "gpu"))
+from front import Front  # noqa: E402
+from kdec import MAXF, KDecoder  # noqa: E402
+
 SR = 24000
-BERT_BUCKETS = (16, 32, 64, 128, 256, 512)
-DEC_BUCKETS = (32, 48, 64, 128, 256)
-LEAD_CAP = None  # capping the leading boundary silence before decoding changes the sound (global norms); keep exact
 HOP = 600  # audio samples per aligned frame
 # max trailing pause kept after a chunk, by its final punctuation (seconds)
 PAUSE = {",": 0.18, ";": 0.3, ":": 0.3, "—": 0.25, ".": 0.38, "!": 0.38, "?": 0.38}
 
 
-def _bucket(n, buckets):
-    for b in buckets:
-        if n <= b:
-            return b
-    return None
+def _trim_heap():
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except OSError:
+        pass
 
 
 class Engine:
-    def __init__(self, models=HERE / "models", bert_dev="GPU", dec_dev="custom", cpu_dev="CPU",
-                 dec_buckets=DEC_BUCKETS, bert_buckets=BERT_BUCKETS):
-        """dec_dev: "custom" = hand-written OpenCL/XMX decoder (gpu/kdec.py, exact lengths),
-        or an OpenVINO device ("GPU", "CPU") for the bucketed masked IR decoders."""
+    def __init__(self, models=HERE / "models"):
         models = Path(models)
-        self.core = ov.Core()
-        self.core.set_property({"CACHE_DIR": str(models / "cache")})
-        hint = {"PERFORMANCE_HINT": "LATENCY"}
-        comp = lambda name, dev: self.core.compile_model(self.core.read_model(models / f"{name}.xml"), dev, hint)
         t = time.perf_counter()
-        self.bert = {L: comp(f"bert_L{L}", bert_dev).create_infer_request() for L in bert_buckets}
-        self.custom = dec_dev == "custom"
-        if self.custom:
-            sys.path.insert(0, str(HERE / "gpu"))
-            from kdec import MAXF, KDecoder
-            self.kdec = KDecoder()
-            self.dec = {}
-            dec_buckets = (MAXF,)
-        else:
-            self.dec = {F: comp(f"decoder_F{F}", dec_dev).create_infer_request() for F in dec_buckets}
-        # small LSTM graphs: OpenVINO's automatic threading spins ~14 cores for a few ms of
-        # work (f0n: 26 ms wall / 181 ms CPU); 4 threads is fastest (9 ms / 35 ms CPU).
-        nthr = int(os.environ.get("KOKORO_CPU_THREADS", "2"))  # measured best: 2 (82 ms TTFT, 258 mJ/audio-s)
-        cpu_cfg = dict(hint, INFERENCE_NUM_THREADS=nthr) if cpu_dev == "CPU" else hint
-        compc = lambda name: self.core.compile_model(self.core.read_model(models / f"{name}.xml"), cpu_dev, cpu_cfg)
-        self.pros = compc("prosody").create_infer_request()
-        # F0/N predictor: "cpu" = whole OpenVINO graph on CPU; "gpu" = shared LSTM on CPU, the six
-        # AdainResBlk1d blocks on the custom GPU kernels (less CPU energy, ~3 ms more latency)
-        self.f0n_mode = os.environ.get("KOKORO_F0N", "gpu") if dec_dev == "custom" else "cpu"
-        if self.f0n_mode == "gpu":
-            self.f0n_lstm = compc("f0n_lstm").create_infer_request()
-        else:
-            self.f0n = compc("f0n").create_infer_request()
-        self.tenc = compc("textenc").create_infer_request()
-        self.load_s = time.perf_counter() - t
+        self.kdec = KDecoder()
+        self.front = Front(self.kdec, models / "cpu_parts.npz")
         a = np.load(models / "assets.npz")
         self.voice = a["voice"]  # [510,1,256]
         self.lin_w, self.lin_b = a["lin_w"], float(a["lin_b"][0])
         self.vocab = json.loads((models / "vocab.json").read_text())
-        self.bert_buckets, self.dec_buckets = tuple(bert_buckets), tuple(dec_buckets)
         self.rng = np.random.default_rng()
-        self.lead_cap = LEAD_CAP
-        from misaki import en, espeak
-        self.g2p = en.G2P(trf=False, british=False, fallback=espeak.EspeakFallback(british=False))
+        from g2p_lean import make_g2p
+        self.g2p = make_g2p(british=False)  # misaki, compact lexicon + slim spaCy (same phonemes)
+        self.load_s = time.perf_counter() - t
         self.warmup()
+        _trim_heap()  # return load-time temporaries (npz arrays, packing buffers) to the OS
 
     def warmup(self):
-        for L, r in self.bert.items():
-            r.infer([np.zeros((1, L), np.int64), np.ones((1, L), np.int64)])
-        for F, r in self.dec.items():  # (OpenVINO decoders only)
-            m = lambda n: np.ones((1, 1, n), np.float32)
-            r.infer([np.zeros((1, 512, F), np.float32), np.zeros((1, 2 * F), np.float32), np.zeros((1, 2 * F), np.float32),
-                     np.zeros((1, 128), np.float32), np.zeros((1, 22, 120 * F + 1), np.float32),
-                     m(F), m(2 * F), m(20 * F), m(120 * F + 1)])
         self.synth_phonemes("hˈɛloʊ.")
         self.synth_phonemes("hˈɛloʊ ðˈɛɹ, ðɪs ɪz ə lˈɑŋɡɚ wˈɔɹm ˈʌp sˈɛntəns.")
 
@@ -129,80 +90,43 @@ class Engine:
     def synth_phonemes(self, ps: str, speed=1.0, timings=None):
         T = {} if timings is None else timings
         tk = lambda k, t0: T.__setitem__(k, T.get(k, 0) + time.perf_counter() - t0)
-        ids = [0, *[self.vocab[p] for p in ps if p in self.vocab], 0]
-        n_ps = len(ids) - 2
+        ids = np.array([0, *[self.vocab[p] for p in ps if p in self.vocab], 0], np.int64)
         L = len(ids)
-        ref_s = self.voice[min(max(n_ps - 1, 0), len(self.voice) - 1)]  # [1,256]
-        s_dec, s_pros = ref_s[:, :128].astype(np.float32), ref_s[:, 128:].astype(np.float32)
+        ref_s = self.voice[min(max(L - 3, 0), len(self.voice) - 1)]  # [1,256]
+        s_dec, s_pros = ref_s[0, :128].astype(np.float32), ref_s[0, 128:].astype(np.float32)
 
         t = time.perf_counter()
-        # text encoder only needs the ids: run it on CPU while BERT runs on the GPU
-        self.tenc.start_async([np.array([ids], np.int64)])
-        Lb = _bucket(L, self.bert_buckets)
-        idp = np.zeros((1, Lb), np.int64); idp[0, :L] = ids
-        att = np.zeros((1, Lb), np.int64); att[0, :L] = 1
-        d_en = self.bert[Lb].infer([idp, att])[0][:, :, :L]
+        # text encoder: convs + gates on the iGPU ahead of BERT; its LSTM recurrence runs on a
+        # CPU thread (the Rust call releases the GIL) while the iGPU runs BERT
+        th, res = self.front.textenc_start(ids)
+        d_en = self.kdec.bert(ids, readback=False)  # GPU buffer [L, 512]
         tk("bert", t)
 
         t = time.perf_counter()
-        r = self.pros.infer([np.ascontiguousarray(d_en), s_pros])
-        d, dur = r[0], r[1]
-        pd = np.clip(np.round(dur[0] / speed), 1, None).astype(np.int64)
-        if self.lead_cap is not None:
-            pd[0] = min(pd[0], self.lead_cap)
+        dur, gx_sh = self.front.prosody(d_en, L, s_pros)
+        pd = np.clip(np.round(dur / speed), 1, None).astype(np.int64)
         Fr = int(pd.sum())
-        idx = np.repeat(np.arange(L), pd)
-        en = np.ascontiguousarray(d[0].T[:, idx][None])  # d^T @ aln == gather
-        if self.f0n_mode == "gpu" and self.custom:
-            x = self.f0n_lstm.infer([en])[0][0]
-            f0, n = self.kdec.f0n(x, s_pros[0])
-            f0, n = f0[None], n[None]
-        else:
-            r = self.f0n.infer([en, s_pros])
-            f0, n = r[0], r[1]
-        self.tenc.wait()
-        t_en = self.tenc.get_output_tensor(0).data
-        asr = np.ascontiguousarray(t_en[:, :, idx])
-        tk("cpu_lstm", t)
-
-        if self.custom:
-            if Fr > self.dec_buckets[0]:  # longer than the decoder's buffers: split at a pause
-                a, b = self._halve(ps)
-                ya, pa = self.synth_phonemes(a, speed, T)
-                yb, pb = self.synth_phonemes(b, speed, T)
-                return np.concatenate([ya, yb]), np.concatenate([pa, pb])
-            # harmonic source, STFT, decoder, iSTFT all on the GPU; host gets the waveform
-            t = time.perf_counter()
-            seed = int(self.rng.integers(1, 2**31))
-            audio = self.kdec.run(asr[0], f0[0], n[0], s_dec[0], source=(self.lin_w, self.lin_b, seed, 1), out="audio")
-            tk("decoder", t)
-            T["frames"], T["bucket"] = Fr, "exact"
-            return audio, pd
-
-        t = time.perf_counter()
-        har = dsp.harmonic_source(f0[0], self.lin_w, self.lin_b, rng=self.rng)
-        tk("source", t)
-
-        t = time.perf_counter()
-        Fb = _bucket(Fr, self.dec_buckets)
-        if Fb is None:  # too long for the largest bucket: split at a pause and recurse
+        if Fr > MAXF:  # longer than the decoder's buffers: split at a pause
+            th.join()
             a, b = self._halve(ps)
-            T.pop("frames", None)
             ya, pa = self.synth_phonemes(a, speed, T)
             yb, pb = self.synth_phonemes(b, speed, T)
             return np.concatenate([ya, yb]), np.concatenate([pa, pb])
-        pad = lambda a, nn: np.pad(a.astype(np.float32), [(0, 0)] * (a.ndim - 1) + [(0, nn - a.shape[-1])])
-        msk = lambda v, nn: np.pad(np.ones((1, 1, v), np.float32), [(0, 0), (0, 0), (0, nn - v)])
-        out = self.dec[Fb].infer([pad(asr, Fb), pad(f0, 2 * Fb), pad(n, 2 * Fb), s_dec, pad(har[None], 120 * Fb + 1),
-                                  msk(Fr, Fb), msk(2 * Fr, 2 * Fb), msk(20 * Fr, 20 * Fb), msk(120 * Fr + 1, 120 * Fb + 1)])
-        Tv = 120 * Fr + 1
-        mag, ph = out[0][0, :, :Tv], out[1][0, :, :Tv]
-        tk("decoder", t)
-
+        idx = np.repeat(np.arange(L), pd)
+        x = self.front.shared(gx_sh, idx)  # [F, 512]
+        tk("cpu_lstm", t)
         t = time.perf_counter()
-        audio = dsp.istft(mag.astype(np.float64), ph.astype(np.float64))
-        tk("istft", t)
-        T["frames"], T["bucket"] = Fr, Fb
+        f0, n = self.kdec.f0n(x, s_pros)
+        tk("f0n", t)
+        th.join()
+        asr = np.ascontiguousarray(res["t_en"][:, idx])
+
+        # harmonic source, STFT, decoder, iSTFT all on the iGPU; host gets the waveform
+        t = time.perf_counter()
+        seed = int(self.rng.integers(1, 2**31))
+        audio = self.kdec.run(asr, f0, n, s_dec, source=(self.lin_w, self.lin_b, seed, 1), out="audio")
+        tk("decoder", t)
+        T["frames"] = Fr
         return audio, pd
 
     @staticmethod
