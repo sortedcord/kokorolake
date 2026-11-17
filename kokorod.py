@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Streaming Kokoro TTS daemon (drop-in for ttsd: same socket protocol).
+"""kokorolake daemon: streaming Kokoro TTS over a Unix socket.
 
 Socket $XDG_RUNTIME_DIR/ttsd.sock; first line is a command, the rest (until EOF) is text:
   SAY   <text...>   queue text; audio streams chunk by chunk as it is synthesized
@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from engine import SR, Engine  # noqa: E402
+from kokorolake.engine import SR, Engine  # noqa: E402
 
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
 _island_pool = ThreadPoolExecutor(max_workers=1)

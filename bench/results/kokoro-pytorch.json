@@ -1,0 +1,1 @@
+{"engine": "kokoro-pytorch", "label": "kokoro (PyTorch, CPU)", "load_s": 27.74682592402678, "idle_w": 8.875140169703517, "audio_s": 16.0, "ttfa_ms": 2623.9374540164135, "total_ms": 22568.401431955863, "rtf": 1.4105250894972414, "cpu_s_per_audio_s": 16.936367687125, "mj_per_audio_s": 10787.584334626825, "peak_rss_mb": 1493.3828125, "gpu_mb": 0.0, "reps": 5}

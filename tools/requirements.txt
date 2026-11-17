@@ -1,0 +1,7 @@
+# weight export, verification and charts (not needed at runtime)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+kokoro==0.9.4
+misaki[en]==0.9.4
+pyopencl
+matplotlib

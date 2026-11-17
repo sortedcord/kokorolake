@@ -1,9 +1,6 @@
 .venv/
-.venv-rt/
-models/
-scratch/
-ref/*.wav
-*.npz
+.venv-tools/
+weights/
+rust/target/
 __pycache__/
-gpu/dec_weights.npz
-.venv-xpu/
+*.wav

@@ -1,0 +1,1 @@
+{"engine": "kokoro-onnx-int8", "label": "kokoro-onnx int8 (CPU)", "load_s": 3.7138897279510275, "idle_w": 8.573177418834263, "audio_s": 11.456, "ttfa_ms": 252.10499396780506, "total_ms": 2923.3278459869325, "rtf": 0.25517875750584257, "cpu_s_per_audio_s": 3.404370082664107, "mj_per_audio_s": 2510.1726876999837, "peak_rss_mb": 529.1328125, "gpu_mb": 0.0, "reps": 5}

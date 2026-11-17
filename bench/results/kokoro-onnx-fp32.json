@@ -1,0 +1,1 @@
+{"engine": "kokoro-onnx-fp32", "label": "kokoro-onnx fp32 (CPU)", "load_s": 8.962684733967762, "idle_w": 8.876649362838789, "audio_s": 11.477333333333334, "ttfa_ms": 651.2629449716769, "total_ms": 7603.430295013823, "rtf": 0.6624735968006932, "cpu_s_per_audio_s": 8.931078174692145, "mj_per_audio_s": 6035.578810263392, "peak_rss_mb": 824.44140625, "gpu_mb": 0.0, "reps": 5}

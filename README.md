@@ -1,137 +1,190 @@
-# kokoro_npu: Kokoro-82M split across GPU / CPU (and tested on the NPU)
+# kokorolake
 
-Custom inference for [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) on an
-Intel Core Ultra 5 225H (Arrow Lake: Arc 130T/140T iGPU, NPU 3720, 14-core CPU) with
-OpenVINO. Goal: lowest time-to-first-audio, then energy, keeping Kokoro's sound.
+kokorolake runs [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) text-to-speech on Intel Core Ultra 200H (Arrow Lake) laptops. It reaches the first audio in about 80 ms, uses a fraction of a watt while speaking, and needs no PyTorch or OpenVINO at runtime.
 
-## Current pipeline (v3: no OpenVINO, no torch at runtime)
+The model and its voice are unchanged. What changes is where each part runs and how. The PL-BERT encoder, the decoder and the iSTFTNet vocoder run as hand-written OpenCL kernels on the matrix engines (XMX) of the integrated Arc GPU. The LSTM recurrences run in Rust on the CPU. Speech is streamed clause by clause.
 
-| Stage | Where |
-|---|---|
-| G2P: misaki with a compact lexicon + slim spaCy (`g2p_lean.py`, identical phonemes) | CPU |
-| text encoder: convs + LSTM input gates as skinny XMX GEMMs, LSTM recurrence in Rust (thread, overlaps BERT) | iGPU + CPU |
-| PL-BERT (ALBERT, 12 shared layers): skinny split-K XMX GEMMs + subgroup attention (`KDecoder.bert`) | iGPU |
-| prosody LSTMs: gates on the iGPU, recurrences in Rust (`rs/`, AVX2/F16C) | iGPU + CPU |
-| F0/N blocks, harmonic source, STFT, decoder, generator, iSTFT | iGPU |
+On a Core Ultra 5 225H, compared with the usual ways of running Kokoro on this chip:
 
-Memory (RSS + GPU allocations): **~480 MB** (v2 with OpenVINO: ~1.28 GB). TTFT ~80-85 ms.
+| | kokorolake | kokoro (PyTorch) | kokoro-onnx int8 | OpenVINO GenAI int8 |
+|:--|--:|--:|--:|--:|
+| Time to first audio | **79 ms** | 2,624 ms | 252 ms | 292 ms (CPU) |
+| Speed (speech seconds per compute second) | **18.1x** | 0.7x | 3.9x | 4.7x (CPU) |
+| Energy per second of speech | **0.26 J** | 10.79 J | 2.51 J | 3.01 J (CPU) |
+| Peak memory (RAM + GPU) | **478 MB** | 1,493 MB | 529 MB | 1,525 MB (CPU) |
 
-What freed the memory:
-- OpenVINO removed: its GPU plugin for BERT (~400 MB incl. GPU heaps) and CPU plugin for the
-  LSTMs (~170 MB). BERT now runs on the custom kernels; the LSTMs are GEMM (iGPU) + recurrence (Rust).
-- misaki lexicon dicts (365k Python entries, 59 MB) -> one UTF-8 blob + offsets, binary search
-  (cached in `models/lexicon_us.npz`); spaCy parser/NER/lemmatizer excluded, not just disabled.
-- generator activations share 5 slots by liveness (stage 0 and 1), exact-size stats partials.
-- malloc_trim after load (heap temporaries from weight packing).
+![Time to first audio](docs/ttfa.png)
 
-Platform features that made the OpenVINO-free path fast:
-- **zero-copy buffers** (`KDecoder.zbuf`, `CL_MEM_USE_HOST_PTR` on page-aligned memory): the iGPU
-  shares RAM, so uploads/readbacks are plain memory writes. A write->kernel->read round trip is
-  18 us vs 430 us with enqueue_copy (pyopencl's non-blocking enqueue_copy alone costs ~230 us).
-- **direct submission (ULLS)** in Intel's compute runtime (`EnableDirectSubmission=1`): ~15% faster
-  decode. OpenVINO's GPU plugin had been enabling it implicitly.
+![Synthesis speed](docs/speed.png)
 
-## v2 pipeline (OpenVINO for BERT + LSTMs)
+![Energy per second of speech](docs/energy.png)
 
-| Stage | Where | First-chunk time |
-|---|---|---|
-| G2P (misaki + espeak fallback) | CPU | ~1 ms |
-| PL-BERT (OpenVINO, static token buckets) | GPU | ~7 ms |
-| text encoder LSTM | CPU, concurrently with BERT | hidden |
-| prosody + F0/N LSTMs (OpenVINO, 4 threads) | CPU | ~12 ms |
-| harmonic source + STFT | CPU (numpy) | ~6 ms |
-| decoder + iSTFTNet generator | **GPU, hand-written OpenCL kernels on the XMX units** (`gpu/kdec.py`) | ~55-65 ms |
-| iSTFT | CPU | ~2 ms |
+![Peak memory](docs/memory.png)
 
-Time to first audio ~85-105 ms, ~330 mJ per second of audio (Piper amy-medium: ~70 ms,
-~490 mJ), real-time factor ~0.05, startup ~3 s.
+## How it works
 
-### Custom decoder (`gpu/kdec.py`)
-- Exact lengths: every kernel takes the sequence length at run time, so there is no
-  padding, no masking, and no per-shape compilation (OpenVINO's GPU plugin needed 0.4-2 s
-  per new shape, so the IR path used padded buckets with masked norms).
-- Convs on the matrix engines: `intel_sub_group_f16_f16_matrix_mad_k16` (DPAS, SIMD8),
-  activations time-major `[T, C]` fp16, weights pre-packed into DPAS A tiles.
-  Transposed convs run as `stride` polyphase convs with an output row stride.
-- Instance-norm statistics come from the conv epilogue (subgroup reductions -> partial
-  rows -> one finalize kernel); norm-apply is fused with leaky-ReLU / snake.
-- Per-call-site cl.Kernel objects keep their arguments, so a new utterance only re-sets
-  length-dependent ints (pyopencl's __call__ costs ~110 us/launch; this ~5 us).
-- 48-49 dB SNR against the fp32 PyTorch decoder.
+```mermaid
+flowchart LR
+    T[Text] --> G[misaki G2P<br/>CPU]
+    G --> TE[Text encoder<br/>convs on iGPU, LSTM on CPU]
+    G --> B[PL-BERT<br/>iGPU]
+    B --> P[Prosody LSTMs<br/>gates on iGPU, recurrence on CPU]
+    P --> F[F0 and energy blocks<br/>iGPU]
+    TE --> D
+    F --> D[Decoder and iSTFTNet vocoder<br/>iGPU]
+    D --> A[24 kHz audio<br/>streamed per clause]
+```
 
-### Things that mattered more than expected
-- **numpy/OpenBLAS thread spinning**: OpenBLAS keeps ~8 worker threads spinning after
-  each small matmul. On this power-capped laptop that stole the iGPU's power budget:
-  decoder 122 -> 72 ms and ~950 -> 9 ms of CPU time per call with OPENBLAS_NUM_THREADS=1.
-- OpenVINO CPU auto-threading on tiny LSTM graphs (f0n 26 ms / 181 ms CPU vs 9 ms / 35 ms
-  with 4 threads).
-- The iGPU is held at ~1 GHz (of 2.2) by PL4 on the USB-C charger (`throttle_reason_pl4`),
-  and an animated wallpaper (mpvpaper) time-shares it.
-- Updating the Quickshell island at request start competed with synthesis; it now
-  updates when the first audio is ready.
+| Stage | Runs on | Notes |
+|:--|:--|:--|
+| Grapheme to phoneme | CPU | misaki, with a compact lexicon and a slimmed spaCy pipeline; identical phonemes |
+| Text encoder | iGPU and CPU | three convolutions and the LSTM input gates on the GPU, the recurrence on a CPU thread that overlaps BERT |
+| PL-BERT (ALBERT, 12 shared layers) | iGPU | split-K matrix kernels for short token sequences, subgroup attention |
+| Duration and prosody LSTMs | iGPU and CPU | gates as one GEMM on the GPU, recurrence in Rust (AVX2, F16C) |
+| F0 and energy predictor | iGPU | six AdaIN residual blocks |
+| Harmonic source, STFT | iGPU | exact-precision sine path, hash-based Gaussian noise |
+| Decoder, generator, iSTFT | iGPU | the bulk of the compute; the host receives finished samples |
 
-## Platform tuning (Core Ultra 5 225H)
+### What made the difference
 
-Measured on the full 14 s passage, energy = package RAPL minus idle:
+**Exact-length kernels on the matrix engines.** Kokoro's decoder normalises every layer over the whole utterance, so padding inputs to a fixed size changes the output. OpenVINO's GPU plugin works around dynamic shapes by compiling a new kernel per input length, which costs seconds per new sentence. kokorolake's kernels take the length at run time. Convolutions use `intel_sub_group_f16_f16_matrix_mad_k16` (DPAS). Instance-norm statistics are reduced in the convolution epilogues, and normalisation is fused with the following activation.
 
-| Change | TTFT | Energy / audio-s | CPU time |
-|---|---|---|---|
-| v2 baseline | 92 ms | 355 mJ | 755 ms |
-| harmonic source + STFT + iSTFT on the iGPU (`source`/`stft`/`istft` kernels, exact fp32 sin) | 87 ms | 306 mJ | 670 ms |
-| F0/N predictor's six AdainResBlk1d blocks on the iGPU (shared LSTM stays on CPU) | 85 ms | 281 mJ | 507 ms |
-| OpenVINO CPU threads 4 -> 2 | 82 ms | 258 mJ | 397 ms |
+**Zero-copy transfers.** The iGPU shares RAM with the CPU. All host and device exchanges therefore go through page-aligned buffers created with `CL_MEM_USE_HOST_PTR`, which both sides access in place. A write, kernel and read round trip takes 18 µs this way, against 430 µs through `clEnqueueReadBuffer` and `clEnqueueWriteBuffer`. That matters because the prosody stage alternates between GPU and CPU several times per clause.
 
-Tried and dropped (no gain or worse):
-- pinning to E-cores (4-11): same latency, energy within noise; LP-E cores (12-13):
-  OpenVINO's CPU plugin refuses them
-- GuC SLPC knobs (ignore efficient freq, min freq 1600 MHz): no effect, the iGPU is held
-  at ~1 GHz by PL4 on the USB-C charger
-- cl_khr_throttle_hints / cl_khr_priority_hints queues: within noise
-- PL-BERT on the custom kernels (`KDecoder.bert`, correct to 3e-3): 21-29 ms vs 6.5-8.4 ms
-  for OpenVINO's GPU plugin (tiny-M matmuls are latency-bound in this conv kernel)
-- PL-BERT on the NPU: slower (10.7 ms) and +416 MB vs +225 MB on the GPU
+**Direct submission.** Intel's compute runtime can let the GPU poll a ring buffer for new work instead of going through the kernel driver for every batch. Setting `EnableDirectSubmission=1` makes the decoder about 15% faster. OpenVINO enables this implicitly. Plain OpenCL queues do not get it by default. Idle power is unchanged.
 
-## Placement study (v1, OpenVINO only)
+**Keeping the CPU quiet.** CPU and GPU share one package power budget, and on this laptop the GPU is held near 1 GHz by the power limit. numpy's OpenBLAS left about eight threads spin-waiting after every small matrix product. On its own that slowed the GPU decoder from 72 to 122 ms. kokorolake forces single-threaded BLAS and sleeps instead of spinning while waiting for the GPU. It moved every stage that the GPU does better off the CPU. The CPU now spends about 20 ms of compute per second of speech.
 
-| Stage | Device | Why |
-|---|---|---|
-| G2P (misaki + espeak fallback) | CPU | rules/lookups, ~1 ms |
-| PL-BERT (static token buckets 16-512) | GPU | 5 ms / 28 mJ vs NPU 11 ms / 53 mJ vs CPU 41 ms / 306 mJ |
-| Prosody / F0-N / text-encoder LSTMs | CPU (dynamic) | NPU has no LSTM kernel; ~2% of compute |
-| Alignment, harmonic source + STFT, iSTFT | CPU (numpy) | tiny, dynamic |
-| Decoder + iSTFTNet vocoder (frame buckets 32-256) | GPU | ~85% of compute; NPU was 6x slower and inaccurate in fp16 |
+**Rust for the sequential part.** An LSTM step depends on the previous one, so the recurrence stays on the CPU. Its input projections, which are most of the arithmetic, are batched into one GEMM on the GPU. The Rust kernel keeps the recurrent weights in fp16, converts them with F16C, and runs both directions on their own threads.
 
-The NPU ended up unused for TTS; it runs Whisper STT (see ../stt_daemon).
+**Less resident memory.** Dropping OpenVINO removed about 570 MB of plugin and heap memory. Storing misaki's 365,000-entry pronunciation dictionary as one UTF-8 blob with offsets saved 57 MB, with phonemes identical on a test set covering numbers, heteronyms, names and acronyms. Generator activations share five buffers, chosen by liveness. Weights are streamed from disk one tensor at a time while they are packed.
 
-## How the decoder stays exact with padded (static) shapes
+**The NPU stays free.** The NPU was evaluated for every stage. It has no kernel for LSTMs and runs Kokoro's decoder six times slower than the iGPU. Its fp16 accumulation also degrades the decoder's output, and it is slower than the iGPU for BERT. The NPU is better used for speech recognition, which can run alongside.
 
-Every AdaIN instance-norm in Kokoro averages over the whole utterance, so padding would
-change the sound. The exported decoder (`kparts.DecoderPart4D`) takes per-rate masks
-(40/80/800/4800 Hz), computes norm statistics over valid frames only, and zeroes the
-padding right before every conv with kernel > 1. Padded output matches the unpadded
-original to ~4e-5. Other GPU-specific rewrites (all numerically equivalent):
+## Fidelity
 
-- depthwise ConvTranspose (k3,s2) -> polyphase elementwise ops (GPU miscomputes it)
-- nearest x2 upsample -> expand+reshape (GPU mis-fuses Interpolate + 1x1 conv)
-- [1,C,T] -> [1,C,1,T] with 2D convs; norm stats as masked ReduceMean with the mask
-  pre-scaled by 1/valid_fraction (avoids a GPU fusion bug and fp16 overflow)
-- eps derived from an input so the GPU plugin doesn't push the norm chain to fp32
+kokorolake computes in fp16 and the reference in fp32. `tools/verify.py` compares the two with Kokoro's random noise source disabled, and also compares the reference against itself across noise seeds, which is the variation Kokoro has by design.
 
-Also: the AdainResBlk1d pools use legacy weight_norm hooks; `bake_weight_norm` folds both
-kinds (reading `.weight` of a legacy-hooked module gives stale random init weights).
+| Sentence | Frames (kokorolake / reference) | Pitch error, median (p95) | Spectral distance to reference | Reference vs itself |
+|:--|--:|--:|--:|--:|
+| "Wait, what? All of the tests passed?" | 99 / 99 | 0.3 (0.7) cents | 3.2 dB | 2.1 dB |
+| "Okay, but here's the bad news: the build broke..." | 224 / 224 | 0.3 (0.9) cents | 3.1 dB | 2.0 dB |
+| "The meeting is at 3:45 PM on March 3rd; it costs $12.50." | 256 / 256 | 0.4 (1.1) cents | 3.6 dB | 1.9 dB |
 
-## Files
+Phoneme durations match exactly. Pitch stays within about one cent, well below the five cents people can hear. Listening side by side with the original PyTorch model, the only audible difference was the length of the pauses between sentences, which comes from kokorolake's chunking.
 
-- `kparts.py`   model split + export-friendly rewrites
-- `dsp.py`      numpy harmonic source / STFT / iSTFT (ports of Kokoro's torch code)
-- `export_ov.py` export parts to OpenVINO IR (`--dim 4d --norm reduce --eps-trick 1`)
-- `engine.py`   runtime (OpenVINO + numpy + misaki, no torch)
-- `kokorod.py`  streaming daemon, same socket protocol as ttsd
-- `verify_parts.py`, `bench_devices.py`, `bench_energy.py`, `ttft.py`
+## Requirements
 
-## Environments
+- An Intel GPU with SIMD8 DPAS, such as the Arc 130T or 140T in Core Ultra 200H processors. The kernels were developed and tested on a Core Ultra 5 225H only. Meteor Lake iGPUs have no XMX units. Lunar Lake's Xe2 GPU has them but works in SIMD16, so it would need SIMD16 variants of the kernels.
+- Linux with Intel's compute runtime for OpenCL (`intel-compute-runtime`).
+- Python 3.12. misaki does not support 3.13 or later.
+- Rust (`cargo`) for the LSTM kernel.
 
-- `.venv`    (Python 3.12): torch + kokoro, for export/verification
-- `.venv-rt` (Python 3.12): runtime only (openvino, numpy, misaki, spacy, espeak)
+## Installation
 
-Rebuild models: `.venv/bin/python export_ov.py --dim 4d --norm reduce --eps-trick 1 --bert 16,32,64,128,256,512 --decoder 32,48,64,128,256`
+```sh
+git clone <this repository> kokorolake && cd kokorolake
+
+# runtime
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -r requirements.txt
+cargo build --release --manifest-path rust/Cargo.toml
+
+# one-time weight export (PyTorch on the CPU; not needed afterwards)
+uv venv --python 3.12 .venv-tools
+uv pip install --python .venv-tools/bin/python -r tools/requirements.txt
+.venv-tools/bin/python tools/export.py --voice af_aoede
+```
+
+The export writes `weights/`. The voice pack is baked in at this step. To switch voices, run the export again with another voice name, such as `af_heart` or `bm_george`.
+
+## Usage
+
+From Python:
+
+```python
+from kokorolake.engine import Engine
+
+engine = Engine()  # about 2 s to start, 6 s on the very first run while kernels compile
+for audio, timings in engine.stream("Hello there. This streams one clause at a time."):
+    play(audio)  # float32 mono, 24 kHz
+```
+
+As a daemon that other programs can talk to:
+
+```sh
+.venv/bin/python kokorod.py   # listens on $XDG_RUNTIME_DIR/ttsd.sock
+./say "The build finished, and all the tests passed."
+./say --stop                  # cut off speech and clear the queue
+```
+
+The socket protocol is a single connection per message. The first line is `SAY` or `STOP`, and the rest of the stream, up to EOF, is the text. Audio is played through PipeWire (`pw-play`) as each clause is ready. A systemd user unit keeps it running:
+
+```ini
+[Unit]
+Description=kokorolake text-to-speech
+
+[Service]
+ExecStart=%h/kokorolake/.venv/bin/python %h/kokorolake/kokorod.py
+Restart=on-failure
+Nice=5
+
+[Install]
+WantedBy=default.target
+```
+
+## Benchmarks
+
+Every engine spoke the same 15-second passage in the same voice (`af_aoede`). The text was split into the same sentence and clause chunks, which were synthesised one after another. Time to first audio is the latency of the first chunk.
+
+Each figure is the median of five to seven runs after a warm-up pass. Energy is the package energy from RAPL, minus idle power over the same interval. Memory is the peak resident set plus GPU allocations from DRM `fdinfo`. GPU allocations count because the integrated GPU's memory is system RAM.
+
+| Engine | Time to first audio | Speed | Energy per second of speech | CPU time per second of speech | RAM | GPU |
+|:--|--:|--:|--:|--:|--:|--:|
+| kokorolake | 79 ms | 18.1x | 0.26 J | 0.02 s | 268 MB | 210 MB |
+| kokoro-onnx int8 (CPU) | 252 ms | 3.9x | 2.51 J | 3.40 s | 529 MB | |
+| OpenVINO GenAI int8 (CPU) | 292 ms | 4.7x | 3.01 J | 0.80 s | 1,525 MB | |
+| kokoro-onnx fp32 (CPU) | 651 ms | 1.5x | 6.04 J | 8.93 s | 824 MB | |
+| OpenVINO GenAI int8 (iGPU) | 1,566 ms | 1.0x | 4.67 J | 0.64 s | 809 MB | 1,623 MB |
+| kokoro, PyTorch (CPU) | 2,624 ms | 0.7x | 10.79 J | 16.94 s | 1,493 MB | |
+
+The machine was a Core Ultra 5 225H with 16 GB RAM, Arch Linux (kernel 7.2), compute runtime 26.40, on a USB-C charger. It was running a normal desktop session during the runs, including a browser and an animated wallpaper, so these are everyday numbers rather than best cases.
+
+The versions tested were kokoro 0.9.4 (PyTorch 2.15, CPU), kokoro-onnx 0.4.7 (onnxruntime 1.32), and OpenVINO GenAI 2026.4 with Intel's `OpenVINO/Kokoro-82M-int8-ov` export. OpenVINO on the iGPU compiles a kernel set for each new input length. Its numbers were taken after three extra warm-up passes, and its first pass over the passage took 18 seconds.
+
+To reproduce, run one engine per process in its own environment, then draw the charts:
+
+```sh
+.venv/bin/python bench/compare.py kokorolake 7 > bench/results/kokorolake.json
+.venv-tools/bin/python bench/compare.py kokoro-pytorch > bench/results/kokoro-pytorch.json
+KOKORO_ONNX_DIR=~/kokoro-onnx python bench/compare.py kokoro-onnx-int8 > bench/results/kokoro-onnx-int8.json
+KOKORO_OV_DIR=~/Kokoro-82M-int8-ov python bench/compare.py openvino-cpu > bench/results/openvino-cpu.json
+.venv-tools/bin/python bench/plot.py
+```
+
+The kokoro-onnx and OpenVINO runs need their own environments (`pip install kokoro-onnx` or `openvino-genai`) and model files: `kokoro-v1.0.onnx`, `kokoro-v1.0.int8.onnx` and `voices-v1.0.bin` from the kokoro-onnx releases, and the `OpenVINO/Kokoro-82M-int8-ov` repository from Hugging Face. Reading RAPL energy counters needs permission: `sudo chmod a+r /sys/class/powercap/intel-rapl:0/energy_uj`.
+
+## Limitations
+
+- English with an American accent and one voice per export.
+- A single chunk can be at most 6.4 seconds of speech. Longer sentences are split at the nearest pause.
+- fp16 throughout the GPU path, as described under Fidelity.
+- Tested on one machine and one GPU generation.
+
+## Project layout
+
+```
+kokorolake/engine.py   pipeline, chunking, streaming
+kokorolake/gpu.py      OpenCL kernels and their host code (BERT, F0/N blocks, decoder, DSP)
+kokorolake/front.py    text encoder and prosody predictor (GPU gates plus Rust recurrences)
+kokorolake/lstm.py     ctypes binding for the Rust LSTM kernel
+kokorolake/g2p.py      misaki with a compact lexicon and slim spaCy
+rust/                  LSTM recurrence (AVX2, F16C)
+kokorod.py, say        daemon and command-line client
+tools/                 weight export, fidelity check, PyTorch reference pieces
+bench/                 benchmark harness, results, charts
+```
+
+## Credits
+
+Kokoro-82M is by [hexgrad](https://huggingface.co/hexgrad/Kokoro-82M) and released under Apache 2.0. It builds on StyleTTS 2 and iSTFTNet. Phonemes come from [misaki](https://github.com/hexgrad/misaki), with spaCy and espeak-ng as its fallback.

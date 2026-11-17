@@ -1,0 +1,1 @@
+{"engine": "openvino-cpu", "label": "OpenVINO GenAI int8 (CPU)", "load_s": 5.862608395982534, "idle_w": 8.716167988866488, "audio_s": 15.9, "ttfa_ms": 291.7274520150386, "total_ms": 3387.791218003258, "rtf": 0.21306863006309798, "cpu_s_per_audio_s": 0.7983867039622642, "mj_per_audio_s": 3013.1398926552256, "peak_rss_mb": 1524.9296875, "gpu_mb": 0.0, "reps": 5}
