@@ -1,4 +1,5 @@
-import sys, time; sys.path.insert(0, "/home/sortedcord/Projects/kokorolake")
+"""Quick check: load the engine and time the first audio of a short passage."""
+import sys, time; from pathlib import Path; sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from kokorolake.engine import Engine
 t = time.perf_counter(); e = Engine(); print(f"ready {time.perf_counter()-t:.1f}s")
 t0 = time.perf_counter(); first = None; n = 0

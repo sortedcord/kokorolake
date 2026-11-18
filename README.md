@@ -83,7 +83,7 @@ Phoneme durations match exactly. Pitch stays within about one cent, well below t
 ## Installation
 
 ```sh
-git clone <this repository> kokorolake && cd kokorolake
+git clone https://github.com/sortedcord/kokorolake && cd kokorolake
 
 # runtime
 uv venv --python 3.12 .venv
@@ -185,6 +185,8 @@ tools/                 weight export, fidelity check, PyTorch reference pieces
 bench/                 benchmark harness, results, charts
 ```
 
-## Credits
+## Credits and license
 
 Kokoro-82M is by [hexgrad](https://huggingface.co/hexgrad/Kokoro-82M) and released under Apache 2.0. It builds on StyleTTS 2 and iSTFTNet. Phonemes come from [misaki](https://github.com/hexgrad/misaki), with spaCy and espeak-ng as its fallback.
+
+kokorolake is released under the Apache License 2.0; see [LICENSE](LICENSE).
