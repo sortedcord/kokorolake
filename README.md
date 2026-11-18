@@ -53,7 +53,7 @@ flowchart LR
 
 **Direct submission.** Intel's compute runtime can let the GPU poll a ring buffer for new work instead of going through the kernel driver for every batch. Setting `EnableDirectSubmission=1` makes the decoder about 15% faster. OpenVINO enables this implicitly. Plain OpenCL queues do not get it by default. Idle power is unchanged.
 
-**Keeping the CPU quiet.** CPU and GPU share one package power budget, and on this laptop the GPU is held near 1 GHz by the power limit. numpy's OpenBLAS left about eight threads spin-waiting after every small matrix product. On its own that slowed the GPU decoder from 72 to 122 ms. kokorolake forces single-threaded BLAS and sleeps instead of spinning while waiting for the GPU. It moved every stage that the GPU does better off the CPU. The CPU now spends about 20 ms of compute per second of speech.
+**Keeping the CPU quiet.** CPU and GPU share one package power budget, so CPU work slows the GPU down. numpy's OpenBLAS left about eight threads spin-waiting after every small matrix product. On its own that slowed the GPU decoder from 72 to 122 ms. kokorolake forces single-threaded BLAS and sleeps instead of spinning while waiting for the GPU. It moved every stage that the GPU does better off the CPU. The CPU now spends about 20 ms of compute per second of speech.
 
 **Rust for the sequential part.** An LSTM step depends on the previous one, so the recurrence stays on the CPU. Its input projections, which are most of the arithmetic, are batched into one GEMM on the GPU. The Rust kernel keeps the recurrent weights in fp16, converts them with F16C, and runs both directions on their own threads.
 
@@ -123,7 +123,7 @@ Each figure is the median of five to seven runs after a warm-up pass. Energy is 
 | OpenVINO GenAI int8 (iGPU) | 1,566 ms | 1.0x | 4.67 J | 0.64 s | 809 MB | 1,623 MB |
 | kokoro, PyTorch (CPU) | 2,624 ms | 0.7x | 10.79 J | 16.94 s | 1,493 MB | |
 
-The machine was a Core Ultra 5 225H with 16 GB RAM, Arch Linux (kernel 7.2), compute runtime 26.40, on a USB-C charger. It was running a normal desktop session during the runs, including a browser and an animated wallpaper, so these are everyday numbers rather than best cases.
+All engines were measured on a Core Ultra 5 225H under Linux with Intel compute runtime 26.40.
 
 The versions tested were kokoro 0.9.4 (PyTorch 2.15, CPU), kokoro-onnx 0.4.7 (onnxruntime 1.32), and OpenVINO GenAI 2026.4 with Intel's `OpenVINO/Kokoro-82M-int8-ov` export. OpenVINO on the iGPU compiles a kernel set for each new input length. Its numbers were taken after three extra warm-up passes, and its first pass over the passage took 18 seconds.
 
