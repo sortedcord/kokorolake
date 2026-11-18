@@ -100,37 +100,12 @@ The export writes `weights/`. The voice pack is baked in at this step. To switch
 
 ## Usage
 
-From Python:
-
 ```python
 from kokorolake.engine import Engine
 
 engine = Engine()  # about 2 s to start, 6 s on the very first run while kernels compile
 for audio, timings in engine.stream("Hello there. This streams one clause at a time."):
     play(audio)  # float32 mono, 24 kHz
-```
-
-As a daemon that other programs can talk to:
-
-```sh
-.venv/bin/python kokorod.py   # listens on $XDG_RUNTIME_DIR/ttsd.sock
-./say "The build finished, and all the tests passed."
-./say --stop                  # cut off speech and clear the queue
-```
-
-The socket protocol is a single connection per message. The first line is `SAY` or `STOP`, and the rest of the stream, up to EOF, is the text. Audio is played through PipeWire (`pw-play`) as each clause is ready. A systemd user unit keeps it running:
-
-```ini
-[Unit]
-Description=kokorolake text-to-speech
-
-[Service]
-ExecStart=%h/kokorolake/.venv/bin/python %h/kokorolake/kokorod.py
-Restart=on-failure
-Nice=5
-
-[Install]
-WantedBy=default.target
 ```
 
 ## Benchmarks
@@ -180,7 +155,6 @@ kokorolake/front.py    text encoder and prosody predictor (GPU gates plus Rust r
 kokorolake/lstm.py     ctypes binding for the Rust LSTM kernel
 kokorolake/g2p.py      misaki with a compact lexicon and slim spaCy
 rust/                  LSTM recurrence (AVX2, F16C)
-kokorod.py, say        daemon and command-line client
 tools/                 weight export, fidelity check, PyTorch reference pieces
 bench/                 benchmark harness, results, charts
 ```
