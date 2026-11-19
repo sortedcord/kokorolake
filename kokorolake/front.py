@@ -83,14 +83,15 @@ class Front:
             skinny(k, self.tconv[i], a, L, 512, b, 512)
             k.launch(k.prg_dsp, "layernorm", (L * 64,), (64,), b, a, np.int32(512), *self.tln[i],
                      np.float32(1e-5), np.float32(0.2))
-        if self.tlstm[0].b is None or True:
-            pass
         gx, ev, _ = self._gemm_read(self.tlstm, a, L, 512, "t_g")
         res = {}
 
         def finish():
-            ev.wait()
-            res["t_en"] = self._rec(self.whh["tenc.lstm"], gx[:, :2048].astype(np.float32), L).T
+            try:
+                ev.wait()
+                res["t_en"] = self._rec(self.whh["tenc.lstm"], gx[:, :2048].astype(np.float32), L).T
+            except BaseException as ex:  # surfaced by the caller after join()
+                res["error"] = ex
         th = threading.Thread(target=finish)
         th.start()
         return th, res

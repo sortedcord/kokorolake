@@ -33,6 +33,7 @@ from .gpu import MAXF, WEIGHTS, KDecoder  # noqa: E402
 
 SR = 24000
 HOP = 600  # audio samples per aligned frame
+MAX_TOKENS = 512  # BERT / Kokoro context length
 # max trailing pause kept after a chunk, by its final punctuation (seconds)
 PAUSE = {",": 0.18, ";": 0.3, ":": 0.3, "—": 0.25, ".": 0.38, "!": 0.38, "?": 0.38}
 
@@ -91,6 +92,11 @@ class Engine:
         tk = lambda k, t0: T.__setitem__(k, T.get(k, 0) + time.perf_counter() - t0)
         ids = np.array([0, *[self.vocab[p] for p in ps if p in self.vocab], 0], np.int64)
         L = len(ids)
+        if L > MAX_TOKENS:  # Kokoro's context is 512 tokens including the two boundary tokens
+            a, b = self._halve(ps)
+            ya, pa = self.synth_phonemes(a, speed, T)
+            yb, pb = self.synth_phonemes(b, speed, T)
+            return np.concatenate([ya, yb]), np.concatenate([pa, pb])
         ref_s = self.voice[min(max(L - 3, 0), len(self.voice) - 1)]  # [1,256]
         s_dec, s_pros = ref_s[0, :128].astype(np.float32), ref_s[0, 128:].astype(np.float32)
 
@@ -98,26 +104,31 @@ class Engine:
         # text encoder: convs + gates on the iGPU ahead of BERT; its LSTM recurrence runs on a
         # CPU thread (the Rust call releases the GIL) while the iGPU runs BERT
         th, res = self.front.textenc_start(ids)
-        d_en = self.kdec.bert(ids, readback=False)  # GPU buffer [L, 512]
-        tk("bert", t)
+        try:
+            d_en = self.kdec.bert(ids, readback=False)  # GPU buffer [L, 512]
+            tk("bert", t)
 
-        t = time.perf_counter()
-        dur, gx_sh = self.front.prosody(d_en, L, s_pros)
-        pd = np.clip(np.round(dur / speed), 1, None).astype(np.int64)
-        Fr = int(pd.sum())
-        if Fr > MAXF:  # longer than the decoder's buffers: split at a pause
-            th.join()
-            a, b = self._halve(ps)
-            ya, pa = self.synth_phonemes(a, speed, T)
-            yb, pb = self.synth_phonemes(b, speed, T)
-            return np.concatenate([ya, yb]), np.concatenate([pa, pb])
-        idx = np.repeat(np.arange(L), pd)
-        x = self.front.shared(gx_sh, idx)  # [F, 512]
-        tk("cpu_lstm", t)
-        t = time.perf_counter()
-        f0, n = self.kdec.f0n(x, s_pros)
-        tk("f0n", t)
+            t = time.perf_counter()
+            dur, gx_sh = self.front.prosody(d_en, L, s_pros)
+            pd = np.clip(np.round(dur / speed), 1, None).astype(np.int64)
+            Fr = int(pd.sum())
+            if Fr > MAXF:  # longer than the decoder's buffers: split at a pause
+                th.join()
+                a, b = self._halve(ps)
+                ya, pa = self.synth_phonemes(a, speed, T)
+                yb, pb = self.synth_phonemes(b, speed, T)
+                return np.concatenate([ya, yb]), np.concatenate([pa, pb])
+            idx = np.repeat(np.arange(L), pd)
+            x = self.front.shared(gx_sh, idx)  # [F, 512]
+            tk("cpu_lstm", t)
+            t = time.perf_counter()
+            f0, n = self.kdec.f0n(x, s_pros)
+            tk("f0n", t)
+        finally:
+            th.join()  # never leave the text-encoder thread running if a stage raised
         th.join()
+        if "error" in res:
+            raise res["error"]
         asr = np.ascontiguousarray(res["t_en"][:, idx])
 
         # harmonic source, STFT, decoder, iSTFT all on the iGPU; host gets the waveform

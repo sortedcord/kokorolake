@@ -702,15 +702,20 @@ class KDecoder:
             self._z[name] = z
         return z[0], z[1][:nbytes].view(dtype).reshape(shape)
 
-    def wait(self):
-        """Wait for all enqueued work; sleep-polls on a marker so no CPU core spins."""
+    def wait(self, timeout=15.0):
+        """Wait for all enqueued work; sleep-polls on a marker so no CPU core spins.
+        Raises on a device error (negative event status after a GPU hang/reset) or a stall."""
         ev = cl.enqueue_marker(self.q)
         self.q.flush()
         if self.sleep_wait:
             import time as _t
-            while ev.command_execution_status != cl.command_execution_status.COMPLETE:
+            t0 = _t.monotonic()
+            # status: 3 queued, 2 submitted, 1 running, 0 complete, < 0 error
+            while ev.command_execution_status > cl.command_execution_status.COMPLETE:
+                if _t.monotonic() - t0 > timeout:
+                    raise TimeoutError(f"GPU did not finish within {timeout:.0f} s")
                 _t.sleep(self.sleep_wait)
-        ev.wait()
+        ev.wait()  # raises pyopencl.RuntimeError if the event ended in an error
 
     # Generator-stage activations share 5 physical slots (liveness worked out in run()):
     # stage 0 (800 Hz x 256 ch) and stage 1 (4800 Hz x 128 ch) each have <= 5 live buffers.
